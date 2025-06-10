@@ -1,3 +1,44 @@
+from init import (
+    Device,
+    ComputeModule,
+    IOModule,
+    MemoryModule,
+    L2_CAPACITY,
+    L1_CAPACITY,
+    LOA_CAPACITY,
+    LOB_CAPACITY,
+    LOC_CAPACITY,
+)
+
+_device = Device(
+    compute=ComputeModule(),
+    io=IOModule(),
+    memory=MemoryModule()
+)
+
+# 划分矩阵乘法的策略
+def split_blocks(blocks, max_elems):
+    """
+    对每个 (M,N,K) 二分拆分，直到 M*N*K <= max_elems。
+    优先沿最大维度二分。
+    """
+    out = []
+    for M, N, K in blocks:
+        if M * N * K <= max_elems:
+            out.append((M, N, K))
+        else:
+            if M >= N and M >= K:
+                m2 = M // 2
+                out += split_blocks([(m2, N, K), (M-m2, N, K)], max_elems)
+            elif N >= K:
+                n2 = N // 2
+                out += split_blocks([(M, n2, K), (M, N-n2, K)], max_elems)
+            else:
+                k2 = K // 2
+                out += split_blocks([(M, N, k2), (M, N, K-k2)], max_elems)
+    return out
+
+
 class MatMul_Strategy:
     def __init__(self, dataflow_mode, raw_mnk_values, raw_storage_formats):
         """
@@ -6,37 +47,67 @@ class MatMul_Strategy:
         self.dataflow_mode = dataflow_mode
         self.raw_mnk_values = raw_mnk_values  # 原始矩阵MNK值
         self.raw_storage_formats = raw_storage_formats  # 原始矩阵存储格式
+        self.elem_bytes = 2 if 'fp16' in raw_storage_formats else 4
 
         # 暂时初始化其余属性
-        self.raw_block_strategy = None
+        # self.raw_block_strategy = None
         self.chip_mnk_values = None
-        self.chip_storage_formats = None
-        self.chip_block_strategy = None
+        # self.chip_storage_formats = None
+        # self.chip_block_strategy = None
         self.L2_mnk_values = None
-        self.L2_storage_formats = None
-        self.L2_block_strategy = None
+        # self.L2_storage_formats = None
+        # self.L2_block_strategy = None
         self.L1_mnk_values = None
-        self.L1_storage_formats = None
-        self.L1_block_strategy = None
+        # self.L1_storage_formats = None
+        # self.L1_block_strategy = None
         self.L0_mnk_values = None
-        self.L0_storage_formats = None
-        self.L0_block_strategy = None
+        # self.L0_storage_formats = None
+        # self.L0_block_strategy = None
 
         # 调用策略生成函数，补全剩余属性
         self.generate_strategy()
 
     def generate_strategy(self):
         """
-        Generate the computation strategy for all layers.
+        分块
+        1. Chip无需拆分
+        2. L2 - L2_CAPACITY
+        3. L1 - L1_CAPACITY
+        4. L0(L0=LOA/LOB) - LOx_CAPACITY
         """
-        # 策略生成函数逻辑
-        pass
+        
+        # 1) Chip
+        self.chip_mnk_values = list(self.raw_mnk_values)
+        
+        # 2) L2
+        max_L2 = L2_CAPACITY // self.elem_bytes
+        self.L2_mnk_values = split_blocks(self.chip_mnk_values, max_L2)
 
+        # 3) L1
+        max_L1 = L1_CAPACITY // self.elem_bytes
+        self.L1_mnk_values = []
+        for block in self.L2_mnk_values:
+            self.L1_mnk_values += split_blocks([block], max_L1)
+            
+        # 4) L0 (使用 LOA + LOB 容量中较小者)
+        max_LOA = LOA_CAPACITY // self.elem_bytes
+        max_LOB = LOB_CAPACITY // self.elem_bytes
+        max_LO  = min(max_LOA, max_LOB)
+        self.L0_mnk_values = []
+        for block in self.L1_mnk_values:
+            self.L0_mnk_values += split_blocks([block], max_LO)
+
+    def calculate_cycles(self):
+        # 本层无计算
+        return 0
+    
+    
 class Simulate:
     """
     从原始矩阵分块到芯片上
     """
     def __init__(self, M, N, K, M_tile, N_tile, K_tile, block_strategy, storage_format, next_layer: 'Chip_tile' = None):
+        
         # 决策变量
         self.M_tile = M_tile
         self.N_tile = N_tile
@@ -65,11 +136,23 @@ class Simulate:
         """
         Calculate the cycles for the current layer based on the next layer's metrics.
         """
+        total = 0.0
         if self.next_layer and isinstance(self.next_layer, Chip_tile):
             self.next_layer.calculate_cycles()
             # 仿真逻辑
-            pass
-
+        
+        # Off-chip to L2
+        '''
+        size_A = self.M_tile * self.K_tile * 2
+        size_B = self.K_tile * self.N_tile * 2
+        total += _device.io.load(size_A, 'DRAM', 'L2')
+        total += _device.io.load(size_B, 'DRAM', 'L2')
+        
+        # IO
+        self.M_K_io_cycle_count = size_A
+        self.K_N_io_cycle_count = size_B
+        return total
+        '''
 class Chip_tile:
     """
     从芯片分块到L2上
@@ -104,12 +187,20 @@ class Chip_tile:
         """
         Calculate the cycles for the current layer based on the next layer's metrics.
         """
+        total = 0.0
         if self.next_layer and isinstance(self.next_layer, L2_tile):
             self.next_layer.calculate_cycles()
             # 仿真逻辑
-            pass
-
-
+            
+        # L2 to L1
+        '''
+        size_A = self.M_tile * self.K_tile * 2
+        size_B = self.K_tile * self.N_tile * 2
+        total += _device.io.load(size_A, 'L2', 'L1')
+        total += _device.io.load(size_B, 'L2', 'L1')
+        return total
+        '''
+        
 class L2_tile:
     """
     从L2分块到每个L1上，910C有24个L1_tile
@@ -146,10 +237,19 @@ class L2_tile:
         Calculate the cycles for the current layer based on the next layer's metrics.
         注意L2 buffer是有一个L2-cache在旁边，这个我们没法主动控制，但是在写代码时要把cache带来的影响考虑进去
         """
+        total = 0
         if self.next_layer and isinstance(self.next_layer, L1_tile):
             self.next_layer.calculate_cycles()
             # 仿真逻辑
-            pass
+        
+        # L1 to L0
+        '''
+        size_A = self.M_tile * self.K_tile * 2
+        size_B = self.K_tile * self.N_tile * 2
+        total += _device.io.load(size_A, 'L1', 'LO')
+        total += _device.io.load(size_B, 'L1', 'LO')
+        return total
+        '''
 
 
 class L1_tile:
@@ -187,10 +287,16 @@ class L1_tile:
         """
         Calculate the cycles for the current layer based on the next layer's metrics.
         """
+        total = 0.0
         if self.next_layer and isinstance(self.next_layer, L0_tile):
             self.next_layer.calculate_cycles()
             # 仿真逻辑
-            pass
+        
+        # Compute L0 and Write Back
+        size_C = self.M_tile * self.N_tile * 2
+        total += _device.compute.compute(self.M_tile, self.N_tile, self.K_tile)
+        total += _device.io.store(size_C, 'LO', 'L1')
+        return total
 
 
 class L0_tile:
@@ -219,5 +325,19 @@ class L0_tile:
         """
         Calculate the cycles for the current layer.
         """
-        # 仿真逻辑
-        pass
+        total = 0
+        size_A = self.M * self.K * 2
+        size_B = self.K * self.N * 2
+        size_C = self.M * self.N * 2
+        
+        # 1) LO -> SM
+        cycles += _device.io.load(size_A, 'LO', 'UB')
+        cycles += _device.io.load(size_B, 'LO', 'UB')
+        
+        # 2) Compute
+        cycles += _device.compute.compute(self.M, self.N, self.K)
+        
+        # 3) UB -> LO (写回)
+        cycles += _device.io.store(size_C, 'UB', 'LO')
+        return cycles
+
