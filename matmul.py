@@ -1,13 +1,16 @@
 from init import (
-    Device,
-    ComputeModule,
-    IOModule,
-    MemoryModule,
     L2_CAPACITY,
     L1_CAPACITY,
     LOA_CAPACITY,
     LOB_CAPACITY,
     LOC_CAPACITY,
+)
+
+from control import (
+    Device,
+    ComputeModule,
+    IOModule,
+    MemoryModule
 )
 
 _device = Device(
