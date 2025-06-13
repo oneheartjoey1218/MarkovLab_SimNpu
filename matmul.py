@@ -6,7 +6,7 @@ from init import (
     LOC_CAPACITY,
 )
 
-from control import (
+from modules import (
     Device,
     ComputeModule,
     IOModule,
