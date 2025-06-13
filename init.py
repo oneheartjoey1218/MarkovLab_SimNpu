@@ -1,19 +1,15 @@
-from hardware import (
-    CUBE_MACS_PER_CYCLE,
-    MIN_ACCESS,
-    IO_BW,
-    L2_CAPACITY,
-    L1_CAPACITY,
-    LOA_CAPACITY,
-    LOB_CAPACITY,
-    LOC_CAPACITY,
-    UB_CAPACITY,
-    SB_CAPACITY,
-)
+from hardware import HW
 
-# （不再定义任何 class 或其它逻辑）
-def main():
-    pass
+# 保持原变量名转发
+CUBE_MACS_PER_CYCLE = HW.CUBE_MACS_PER_CYCLE
 
-if __name__ == "__main__":
-    main()
+L2_CAPACITY  = HW.L2_CAPACITY
+L1_CAPACITY  = HW.L1_CAPACITY
+LOA_CAPACITY = HW.LOA_CAPACITY
+LOB_CAPACITY = HW.LOB_CAPACITY
+LOC_CAPACITY = HW.LOC_CAPACITY
+UB_CAPACITY  = HW.UB_CAPACITY
+SB_CAPACITY  = HW.SB_CAPACITY
+
+MIN_ACCESS = HW.MIN_ACCESS
+IO_BW      = HW.IO_BW
