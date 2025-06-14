@@ -1,5 +1,5 @@
 import math
-from hardware import MIN_ACCESS, IO_BW, CUBE_MACS_PER_CYCLE
+from hardware import HW
 
 def align(size: int, granularity: int) -> int:
     """向上对齐到 granularity 的整数倍"""
@@ -8,14 +8,14 @@ def align(size: int, granularity: int) -> int:
 class ComputeModule:
     def compute(self, M: int, N: int, K: int) -> float:
         """执行 M×K × K×N 矩阵乘，返回周期数"""
-        return (M * N * K) / CUBE_MACS_PER_CYCLE
+        return (M * N * K) / HW.CUBE_MACS_PER_CYCLE
 
 class IOModule:
     def load(self, size: int, src: str, dst: str) -> float:
         """模拟 src->dst 的 DMA，返回周期"""
         key     = f"{src}→{dst}"
-        bw      = IO_BW[key]
-        aligned = align(size, MIN_ACCESS[dst])
+        bw      = HW.IO_BW[key]
+        aligned = align(size, HW.MIN_ACCESS[dst])
         return aligned / bw
 
     def store(self, size_bytes: int, src: str, dst: str) -> float:
