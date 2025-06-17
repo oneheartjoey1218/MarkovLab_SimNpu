@@ -1,15 +1,9 @@
+from matmul import *
 from hardware import HW
 
-# 保持原变量名转发
-CUBE_MACS_PER_CYCLE = HW.CUBE_MACS_PER_CYCLE
+def main():
+    # 测试用例
+    pass
 
-L2_CAPACITY  = HW.L2_CAPACITY
-L1_CAPACITY  = HW.L1_CAPACITY
-LOA_CAPACITY = HW.LOA_CAPACITY
-LOB_CAPACITY = HW.LOB_CAPACITY
-LOC_CAPACITY = HW.LOC_CAPACITY
-UB_CAPACITY  = HW.UB_CAPACITY
-SB_CAPACITY  = HW.SB_CAPACITY
-
-MIN_ACCESS = HW.MIN_ACCESS
-IO_BW      = HW.IO_BW
+if __name__ == "__main__":
+    main()
