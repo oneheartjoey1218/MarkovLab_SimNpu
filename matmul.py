@@ -2,7 +2,8 @@ from modules import (
     Device,
     ComputeModule,
     IOModule,
-    MemoryModule
+    MemoryModule,
+    L2_CACHE_MGR
 )
 
 from hardware import HardwareSpec, HW # 全局硬件实例
@@ -16,6 +17,7 @@ _device = Device(
 from math import ceil
 import numpy as np
 import copy
+
 # 划分矩阵乘法的策略
 def split_blocks(blocks, max_elems):
     """
@@ -89,7 +91,7 @@ class MatMul_Strategy:
         1. Chip无需拆分
         2. L2 - L2_CAPACITY
         3. L1 - L1_CAPACITY
-        4. L0(L0=L0A/L0B) - LOx_CAPACITY
+        4. L0(L0=L0A/L0B) - L0x_CAPACITY
         """
         
         # 1) Chip
@@ -419,7 +421,7 @@ class Chip_tile:
     """
     从芯片分块到 L1 上，910C有24个L1_tile和24个UB_tile。这里的逻辑要仔细想清楚，包括往L1的io读时间、从UB回来的io写时间、L2 cache机制等因素
     """
-    def __init__(self, strategy: 'MatMul_Strategy' = None):
+    def __init__(self, base_address = None, strategy: 'MatMul_Strategy' = None, ):
         # 下层结构数量与初始化
         self.L1_num = strategy.chip_type.AI_CORE_COUNT     # L1_num是L1_tile的数量，来自device信息超参数
         self.next_layers_L1 = [
@@ -435,6 +437,7 @@ class Chip_tile:
         self.K_tile = strategy.L1_mnk_values[2]
         self.block_strategy = strategy.L1_block_strategy   # 分块策略；内积/外积
         self.storage_formats = strategy.L1_storage_formats # 存储格式；行主序/列主序
+        self.base_address = base_address # 基地址，用于计算每个L1_tile的地址
 
         # 约束 # 注意，这里同时要分左右矩阵，所以存储约束需要除以2
         self.size = strategy.chip_type.L1_CAPACITY                  # 芯片L1结构存储容量
@@ -445,7 +448,7 @@ class Chip_tile:
         
         # 硬件约束
         self.core_count = strategy.chip_type.AI_CORE_COUNT
-        self.l2_bandwidth_per_cycle = strategy.chip_type.L2_BANDWIDTH # 需要在hardware.py中定义
+        self.l2_bandwidth_per_cycle = strategy.chip_type.L2_BANDWIDTH # 需要在hardware.py中定义 #没找到
         self.clock_freq = strategy.chip_type.CLOCK_FREQ
         self.vector_flops_per_cycle = strategy.chip_type.VECTOR_FLOPS_PER_CYCLE
         self.systolic_input_word_size = strategy.chip_type.SYSTOLIC_INPUT_WORD_SIZE
@@ -466,6 +469,28 @@ class Chip_tile:
         self.compute_cycle_count = self._simulate_chip_tile_compute_cycle_count()
         self.mem_alloc_read_cycle_count = None   # 内存分配耗时
         self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        
+    def calculate_cycles(self):
+        core_cycles = []
+        size_A = self.M_tile * self.K_tile * self.elem_bytes
+        size_B = self.K_tile * self.N_tile * self.elem_bytes
+        size_C = self.M_tile * self.N_tile * self.elem_bytes
+        for core in range(self.L1_num):
+            # 1) DRAM-L2-L1，传入真实基地址
+            addr_A, addr_B = self.base_addresses[core]
+            t1 = L2_CACHE_MGR.read(core, addr_A, size_A) + L2_CACHE_MGR.read(core, addr_B, size_B)
+            # 2) L1-L0A/L0B
+            t2 = max(_device.io.load(size_A, 'L1', 'L0A'), 
+                     _device.io.load(size_B, 'L1', 'L0B'))
+            # 3) Cube-AccumDFF-L0C
+            t3 = _device.compute.compute(self.M_tile, self.N_tile, self.K_tile)
+            t3 += _device.io.store(size_C, 'AccumDFF', 'L0C')   
+            # 4) L0C-UB
+            t4 = _device.io.load(size_C, 'L0C', 'UB')
+            
+            core_cycles.append(t1 + t2 + t3 + t4)
+
+        return core_cycles
         
     def _simulate_chip_tile_io_cycle_count(self, M: int, N: int) -> int:
         """计算IO传输周期数"""
@@ -850,7 +875,7 @@ class L0_tile:
         """
         # Cube 计算
         cube_cycles = _device.compute.compute(self.M_tile, self.N_tile, self.K_tile)
-        # 从AccumDFF 写回L0C
+        # 从 AccumDFF 写回L0C
         size_C = self.M_tile * self.N_tile * self.elem_bytes
         io_cycles = _device.io.store(size_C, 'AccumDFF', 'L0C')
         total = cube_cycles + io_cycles
