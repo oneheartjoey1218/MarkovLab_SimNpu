@@ -2,7 +2,8 @@ from modules import (
     Device,
     ComputeModule,
     IOModule,
-    MemoryModule
+    MemoryModule,
+    L2_CACHE_MGR
 )
 
 from hardware import HardwareSpec, HW # 全局硬件实例
@@ -16,6 +17,7 @@ _device = Device(
 from math import ceil
 import numpy as np
 import copy
+
 # 划分矩阵乘法的策略
 def split_blocks(blocks, max_elems):
     """
@@ -52,15 +54,15 @@ class MatMul_Strategy:
 
         # 暂时初始化其余属性
         self.chip_mnk_values = None
-        self.chip_storage_formats = None
+        self.chip_storage_formats = None # 字符串列表：[左矩阵格式,右矩阵格式]
         self.chip_block_strategy = None # 分块策略，包括内积法（沿M轴和N轴切分）、外积法（沿K轴切分）、内外积结合（都切分，得算两次）
         
         self.L1_mnk_values = None       # L1与UB通用
-        self.L1_storage_formats = None
+        self.L1_storage_formats = None # 字符串列表：[左矩阵格式,右矩阵格式]
         self.L1_block_strategy = None
         
         self.L0_mnk_values = None       # L0A/B与L0C通用
-        self.L0_storage_formats = None
+        self.L0_storage_formats = None # 单个元素：左矩阵格式 或 右矩阵格式，分别用（0，1）表示（常规，特殊）
         self.L0_block_strategy = None
 
         self.DFF_mnk_values = None
@@ -89,7 +91,7 @@ class MatMul_Strategy:
         1. Chip无需拆分
         2. L2 - L2_CAPACITY
         3. L1 - L1_CAPACITY
-        4. L0(L0=LOA/LOB) - LOx_CAPACITY
+        4. L0(L0=L0A/L0B) - L0x_CAPACITY
         """
         
         # 1) Chip
@@ -105,13 +107,13 @@ class MatMul_Strategy:
         for block in self.L2_mnk_values:
             self.L1_mnk_values += split_blocks([block], max_L1)
             
-        # 4) L0 (使用 LOA + LOB 容量中较小者)
-        max_LOA = self.chip_type.LOA_CAPACITY // self.elem_bytes
-        max_LOB = self.chip_type.LOB_CAPACITY // self.elem_bytes
-        max_LO  = min(max_LOA, max_LOB)
+        # 4) L0 (使用 L0A + L0B 容量中较小者)
+        max_L0A = self.chip_type.L0A_CAPACITY // self.elem_bytes
+        max_L0B = self.chip_type.L0B_CAPACITY // self.elem_bytes
+        max_L0  = min(max_L0A, max_L0B)
         self.L0_mnk_values = []
         for block in self.L1_mnk_values:
-            self.L0_mnk_values += split_blocks([block], max_LO)
+            self.L0_mnk_values += split_blocks([block], max_L0)
             
         # DFF
         self.DFF_mnk_values = list(self.L0_mnk_values[0])  # DFF与L0通用
@@ -139,11 +141,12 @@ class Simulate:
         self.block_strategy = strategy.chip_block_strategy # 分块策略；内积/外积
         self.storage_formats = strategy.chip_storage_formats # 存储格式；行主序/列主序
 
-        # 约束
+        # 约束 # 注意，这里同时要分左右矩阵，所以存储约束需要除以2
+        self.size = strategy.chip_type.MEM_CAPACITY                   # 芯片主存结构存储容量
+        # self.min_load_size = strategy.chip_type.MIN_ACCESS['Chip']  # 芯片主存最小访存大小【疑问：这里有没有最小访存大小？】
         self.M = strategy.raw_mnk_values[0] # 原始矩阵大小M
         self.N = strategy.raw_mnk_values[1] # 原始矩阵大小N
         self.K = strategy.raw_mnk_values[2] # 原始矩阵大小K
-        # 最外层没有容量限制
 
         # 向上回传数据
         self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
@@ -151,7 +154,9 @@ class Simulate:
         self.M_K_io_cycle_count = None      # 左矩阵传入耗时
         self.K_N_io_cycle_count = None      # 右矩阵传入耗时
         self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时        
+        self.compute_cycle_count = None     # 内层计算耗时
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -416,7 +421,7 @@ class Chip_tile:
     """
     从芯片分块到 L1 上，910C有24个L1_tile和24个UB_tile。这里的逻辑要仔细想清楚，包括往L1的io读时间、从UB回来的io写时间、L2 cache机制等因素
     """
-    def __init__(self, strategy: 'MatMul_Strategy' = None):
+    def __init__(self, base_address = None, strategy: 'MatMul_Strategy' = None, ):
         # 下层结构数量与初始化
         self.L1_num = strategy.chip_type.AI_CORE_COUNT     # L1_num是L1_tile的数量，来自device信息超参数
         self.next_layers_L1 = [
@@ -432,17 +437,18 @@ class Chip_tile:
         self.K_tile = strategy.L1_mnk_values[2]
         self.block_strategy = strategy.L1_block_strategy   # 分块策略；内积/外积
         self.storage_formats = strategy.L1_storage_formats # 存储格式；行主序/列主序
+        self.base_address = base_address # 基地址，用于计算每个L1_tile的地址
 
-        # 约束
-        self.size = strategy.chip_type.MEM_CAPACITY                # 芯片主存结构存储容量
-        self.min_load_size = strategy.chip_type.MIN_ACCESS['Chip'] # 芯片主存最小访存大小
+        # 约束 # 注意，这里同时要分左右矩阵，所以存储约束需要除以2
+        self.size = strategy.chip_type.L1_CAPACITY                  # 芯片L1结构存储容量
+        self.min_load_size = strategy.chip_type.MIN_ACCESS['Chip']  # 主存最小访存大小
         self.M = strategy.chip_mnk_values[0] # 芯片层矩阵大小M
         self.N = strategy.chip_mnk_values[1] # 芯片层矩阵大小N
         self.K = strategy.chip_mnk_values[2] # 芯片层矩阵大小K
         
         # 硬件约束
         self.core_count = strategy.chip_type.AI_CORE_COUNT
-        self.l2_bandwidth_per_cycle = strategy.chip_type.L2_BANDWIDTH
+        self.l2_bandwidth_per_cycle = strategy.chip_type.L2_BANDWIDTH # 需要在hardware.py中定义 #没找到
         self.clock_freq = strategy.chip_type.CLOCK_FREQ
         self.vector_flops_per_cycle = strategy.chip_type.VECTOR_FLOPS_PER_CYCLE
         self.systolic_input_word_size = strategy.chip_type.SYSTOLIC_INPUT_WORD_SIZE
@@ -461,6 +467,30 @@ class Chip_tile:
         self.K_N_io_cycle_count = self._simulate_chip_tile_io_cycle_count(self.K, self.N)
         self.M_N_io_cycle_count = self._simulate_chip_tile_io_cycle_count(self.M, self.N)
         self.compute_cycle_count = self._simulate_chip_tile_compute_cycle_count()
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        
+    def calculate_cycles(self):
+        core_cycles = []
+        size_A = self.M_tile * self.K_tile * self.elem_bytes
+        size_B = self.K_tile * self.N_tile * self.elem_bytes
+        size_C = self.M_tile * self.N_tile * self.elem_bytes
+        for core in range(self.L1_num):
+            # 1) DRAM-L2-L1，传入真实基地址
+            addr_A, addr_B = self.base_addresses[core]
+            t1 = L2_CACHE_MGR.read(core, addr_A, size_A) + L2_CACHE_MGR.read(core, addr_B, size_B)
+            # 2) L1-L0A/L0B
+            t2 = max(_device.io.load(size_A, 'L1', 'L0A'), 
+                     _device.io.load(size_B, 'L1', 'L0B'))
+            # 3) Cube-AccumDFF-L0C
+            t3 = _device.compute.compute(self.M_tile, self.N_tile, self.K_tile)
+            t3 += _device.io.store(size_C, 'AccumDFF', 'L0C')   
+            # 4) L0C-UB
+            t4 = _device.io.load(size_C, 'L0C', 'UB')
+            
+            core_cycles.append(t1 + t2 + t3 + t4)
+
+        return core_cycles
         
     def _simulate_chip_tile_io_cycle_count(self, M: int, N: int) -> int:
         """计算IO传输周期数"""
@@ -759,8 +789,10 @@ class L1_tile:
         self.storage_formats = strategy.L0_storage_formats # 存储格式；行主序/列主序
 
         # 约束
-        self.size = strategy.chip_type.L1_CAPACITY              # L1 buffer结构存储容量
-        self.min_load_size= strategy.chip_type.MIN_ACCESS['L1'] # L1 buffer最小访存大小
+        self.size = strategy.chip_type.L0A_CAPACITY              # L0 buffer结构存储容量
+        self.min_load_size= strategy.chip_type.MIN_ACCESS['L1']  # L1 buffer最小访存大小
+          # 注意，由于在L1层关心L0层容量，所以这里没有用if来区分L0A和L0B，后面需要修改一下
+          # 同时，由于这里分块只关系L0A和L0B，所以没有考虑L0C的约束，需要另作考虑
         self.M = strategy.L1_mnk_values[0] # L1 buffer层矩阵大小M
         self.N = strategy.L1_mnk_values[1] # L1 buffer层矩阵大小N
         self.K = strategy.L1_mnk_values[2] # L1 buffer层矩阵大小K        
@@ -772,6 +804,8 @@ class L1_tile:
         self.K_N_io_cycle_count = None      # 右矩阵传入耗时
         self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
         self.compute_cycle_count = None     # 内层计算耗时
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -781,12 +815,12 @@ class L1_tile:
         # L1 to L0A/B
         size_A = self.M_tile * self.K_tile * self.elem_bytes
         size_B = self.K_tile * self.N_tile * self.elem_bytes
-        if size_A > HW.LOA_CAPACITY:
-            raise ValueError(f"LOA overflow: {size_A} > {HW.LOA_CAPACITY}")
-        if size_B > HW.LOB_CAPACITY:
-            raise ValueError(f"LOB overflow: {size_B} > {HW.LOB_CAPACITY}")
-        cyc_A = _device.io.load(size_A, 'L1', 'LOA')
-        cyc_B = _device.io.load(size_B, 'L1', 'LOB')
+        if size_A > HW.L0A_CAPACITY:
+            raise ValueError(f"L0A overflow: {size_A} > {HW.L0A_CAPACITY}")
+        if size_B > HW.L0B_CAPACITY:
+            raise ValueError(f"L0B overflow: {size_B} > {HW.L0B_CAPACITY}")
+        cyc_A = _device.io.load(size_A, 'L1', 'L0A')
+        cyc_B = _device.io.load(size_B, 'L1', 'L0B')
         total = max(cyc_A, cyc_B)
         
         # L0A/B 递归
@@ -815,8 +849,8 @@ class L0_tile:
         self.storage_formats = strategy.DFF_storage_formats # 存储格式；行主序/列主序
         
         # 约束
-        self.size = strategy.chip_type.LOA_CAPACITY              # L0结构存储容量（L0A和L0B是一致的）
-        self.key = 'LOA' if self.L0_id == 0 else 'LOB' # L0A和L0B的key
+        self.size = strategy.chip_type.ABDFF_CAPACITY              # L0结构存储容量（L0A和L0B是一致的）
+        self.key = 'L0A' if self.L0_id == 0 else 'L0B' # L0A和L0B的key
         self.min_load_size = strategy.chip_type.MIN_ACCESS[self.key] # L0的最小访存大小
         self.M = strategy.L0_mnk_values[0] # L0层矩阵大小M
         self.N = strategy.L0_mnk_values[1] # L0层矩阵大小N
@@ -829,19 +863,21 @@ class L0_tile:
         self.K_N_io_cycle_count = None      # 右矩阵传入耗时
         self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
         self.compute_cycle_count = None     # 内层计算耗时
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
         包含：
-        1. LOA/LOB to Cube 寄存器应该没有IO cycle的开销
+        1. L0A/L0B to Cube 寄存器应该没有IO cycle的开销
         2. Cube上运算 MxK  x KxN 的矩阵乘
         3. Accum DFF 寄存器的累加 同1
         """
         # Cube 计算
         cube_cycles = _device.compute.compute(self.M_tile, self.N_tile, self.K_tile)
-        # 从AccumDFF 写回L0C
+        # 从 AccumDFF 写回L0C
         size_C = self.M_tile * self.N_tile * self.elem_bytes
-        io_cycles = _device.io.store(size_C, 'AccumDFF', 'LOC')
+        io_cycles = _device.io.store(size_C, 'AccumDFF', 'L0C')
         total = cube_cycles + io_cycles
         return total
 
@@ -852,7 +888,7 @@ class AB_DFF_tile:
     """
     def __init__(self, strategy: 'MatMul_Strategy' = None):
         # 约束
-        self.size = strategy.chip_type.ABDFF_CAPACITY               # DFF结构存储容量
+        self.size = strategy.chip_type.ABDFF_CAPACITY               # DFF结构存储容量【通常来说应该要用更下层的容量做约束，但这已经是最底层了，我就先写着了】
         self.min_load_size = strategy.chip_type.MIN_ACCESS['ABDFF'] # DFF的最小访存大小
         self.M = strategy.DFF_mnk_values[0] # DFF层矩阵大小M
         self.N = strategy.DFF_mnk_values[1] # DFF层矩阵大小N
@@ -866,6 +902,8 @@ class AB_DFF_tile:
         self.K_N_io_cycle_count = None      # 右矩阵传入耗时
         self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
         self.compute_cycle_count = None     # 内层计算耗时
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
 
     def calculate_cycles(self):
         # 寄存器之间的数据搬运似乎不需要占用计算周期
@@ -891,7 +929,7 @@ class UB_tile:
         self.storage_formats = strategy.L0_storage_formats # 存储格式；行主序/列主序
 
         # 约束，但是约束与L1_tile不同
-        self.size = strategy.chip_type.UB_CAPACITY              # L1 buffer结构存储容量
+        self.size = strategy.chip_type.L0C_CAPACITY             # L0C buffer结构存储容量
         self.min_load_size= strategy.chip_type.MIN_ACCESS['UB'] # L1 buffer最小访存大小
         self.M = strategy.L1_mnk_values[0] # L1 buffer层矩阵大小M【这仨是与L1_tile共用的】
         self.N = strategy.L1_mnk_values[1] # L1 buffer层矩阵大小N
@@ -904,6 +942,8 @@ class UB_tile:
         self.K_N_io_cycle_count = None      # 右矩阵传入耗时
         self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
         self.compute_cycle_count = None     # 内层计算耗时
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -930,8 +970,8 @@ class L0C_tile:
         self.storage_formats = strategy.DFF_storage_formats # 存储格式；行主序/列主序
         
         # 约束
-        self.size = strategy.chip_type.LOC_CAPACITY               # L0结构存储容量（L0A和L0B是一致的）
-        self.min_load_size = strategy.chip_type.MIN_ACCESS['LOC'] # L0的最小访存大小
+        self.size = strategy.chip_type.AccumDFF_CAPACITY          # 寄存器结构存储容量
+        self.min_load_size = strategy.chip_type.MIN_ACCESS['L0C'] # L0的最小访存大小
         self.M = strategy.L0_mnk_values[0] # L0层矩阵大小M
         self.N = strategy.L0_mnk_values[1] # L0层矩阵大小N
         self.K = strategy.L0_mnk_values[2] # L0层矩阵大小K
@@ -943,6 +983,8 @@ class L0C_tile:
         self.K_N_io_cycle_count = None      # 右矩阵传入耗时
         self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
         self.compute_cycle_count = None     # 内层计算耗时
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -951,7 +993,7 @@ class L0C_tile:
         # 结果矩阵字节数
         size_C = self.M_tile * self.N_tile * self.elem_bytes
         # 从L0C 到 UB
-        loc_cycles = _device.io.store(size_C, 'LOC', 'UB')
+        loc_cycles = _device.io.store(size_C, 'L0C', 'UB')
         return loc_cycles
 
 class Accum_DFF_tile:
@@ -960,7 +1002,7 @@ class Accum_DFF_tile:
     """
     def __init__(self, strategy: 'MatMul_Strategy' = None):
         # 约束
-        self.size = strategy.chip_type.AccumDFF_CAPACITY               # DFF结构存储容量
+        self.size = strategy.chip_type.AccumDFF_CAPACITY               # DFF结构存储容量【通常来说应该要用更下层的容量做约束，但这已经是最底层了，我就先写着了】
         self.min_load_size = strategy.chip_type.MIN_ACCESS['AccumDFF'] # DFF的最小访存大小
         self.M = strategy.DFF_mnk_values[0] # DFF层矩阵大小M
         self.N = strategy.DFF_mnk_values[1] # DFF层矩阵大小N
@@ -974,6 +1016,8 @@ class Accum_DFF_tile:
         self.K_N_io_cycle_count = None      # 右矩阵传入耗时
         self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
         self.compute_cycle_count = None     # 内层计算耗时
+        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
+        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
 
     def calculate_cycles(self):
         # 同AB_DFF
