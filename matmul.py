@@ -149,14 +149,14 @@ class Simulate:
         self.K = strategy.raw_mnk_values[2] # 原始矩阵大小K
 
         # 向上回传数据
-        self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
+        self.K_reduction_latency = None # 结果矩阵拼接耗时
         #self.K_reduction_io_count = None   # 停用
-        self.M_K_io_cycle_count = None      # 左矩阵传入耗时
-        self.K_N_io_cycle_count = None      # 右矩阵传入耗时
-        self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.M_K_io_latency = None      # 左矩阵传入耗时
+        self.K_N_io_latency = None      # 右矩阵传入耗时
+        self.M_N_io_latency = None      # 结果矩阵传出耗时
+        self.compute_latency = None     # 内层计算耗时
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -236,9 +236,9 @@ class Simulate:
 
 
         # 6. 初始化总周期数(包含第一个分块的加载时间)
-        total_cycle_count = 0
-        total_cycle_count += (
-            self.tiles[0, 0, 0].M_K_io_cycle_count + self.tiles[0, 0, 0].K_N_io_cycle_count
+        total_latency = 0
+        total_latency += (
+            self.tiles[0, 0, 0].M_K_io_latency + self.tiles[0, 0, 0].K_N_io_latency
         )
 
         # 7. 记录前一个分块的位置
@@ -264,44 +264,44 @@ class Simulate:
             # 9. 计算当前分块的读取延迟（数据加载时间）
             if m == previous_m and k == previous_k:
                 # 情况1：仅N维度变化 → 只需加载新的B矩阵(K_N)
-                current_tile_read_cycle_count = current_tile.K_N_io_cycle_count
+                current_tile_read_latency = current_tile.K_N_io_latency
             elif n == previous_n and k == previous_k:
                 # 情况2：仅M维度变化 → 只需加载新的A矩阵(M_K)
-                current_tile_read_cycle_count = current_tile.M_K_io_cycle_count
+                current_tile_read_latency = current_tile.M_K_io_latency
             else:
                 # 情况3：其他情况 → 需要加载完整的A和B矩阵
-                current_tile_read_cycle_count = current_tile.M_K_io_cycle_count + current_tile.K_N_io_cycle_count
+                current_tile_read_latency = current_tile.M_K_io_latency + current_tile.K_N_io_latency
             
             # 特殊处理：当K>0且跨M/N分块时，需要加载部分和矩阵
             if k > 0 and not (m == previous_m and n == previous_n):
-                current_tile_read_cycle_count += current_tile.M_N_io_cycle_count  # C矩阵加载时间
+                current_tile_read_latency += current_tile.M_N_io_latency  # C矩阵加载时间
 
             # 10. 计算前一个分块的计算延迟
-            previous_tile_compute_cycle_count = previous_tile.compute_cycle_count
+            previous_tile_compute_latency = previous_tile.compute_latency
             if k > 0:  # 如果是K维度的非第一个分块
-                previous_tile_compute_cycle_count += previous_tile.K_reduction_cycle_count
+                previous_tile_compute_latency += previous_tile.K_reduction_latency
 
             # 11. 计算前一个分块的写回延迟
             if m == previous_m and n == previous_n:
                 # 情况1：仍在同一个输出分块 → 无需写回中间结果
-                previous_tile_write_cycle_count = 0
+                previous_tile_write_latency = 0
             else:
                 # 情况2：跨输出分块 → 必须写回当前部分和
-                previous_tile_write_cycle_count = previous_tile.M_N_io_cycle_count
+                previous_tile_write_latency = previous_tile.M_N_io_latency
 
             # 12. 累加周期数（关键路径计算）
             if self.is_double_buffering:
                 # 双缓冲模式：允许加载与计算重叠
-                total_cycle_count += max(
-                    current_tile_read_cycle_count,       # 当前分块加载时间
-                    previous_tile_compute_cycle_count    # 前一分块计算时间
-                ) + previous_tile_write_cycle_count      # 前一分块写回时间
+                total_latency += max(
+                    current_tile_read_latency,       # 当前分块加载时间
+                    previous_tile_compute_latency    # 前一分块计算时间
+                ) + previous_tile_write_latency      # 前一分块写回时间
             else:
                 # 非双缓冲模式：顺序执行各阶段
-                total_cycle_count += (
-                    current_tile_read_cycle_count +      # 串行加载
-                    previous_tile_compute_cycle_count +  # 串行计算
-                    previous_tile_write_cycle_count      # 串行写回
+                total_latency += (
+                    current_tile_read_latency +      # 串行加载
+                    previous_tile_compute_latency +  # 串行计算
+                    previous_tile_write_latency      # 串行写回
                 )
 
             # 更新前一个分块位置
@@ -310,17 +310,17 @@ class Simulate:
             previous_k = k
 
         # 13. 处理最后一个分块的计算和写回
-        total_cycle_count += (
-            self.tiles[-1, -1, -1].M_N_io_cycle_count +  # 最终结果写回时间
-            self.tiles[-1, -1, -1].compute_cycle_count    # 最后一个分块计算时间
+        total_latency += (
+            self.tiles[-1, -1, -1].M_N_io_latency +  # 最终结果写回时间
+            self.tiles[-1, -1, -1].compute_latency    # 最后一个分块计算时间
         )
 
         # 14. 处理K维度的归约尾端
         if previous_k > 0:  # 如果K方向有多个分块
-            total_cycle_count += ceil(self.tiles[-1, -1, -1].K_reduction_cycle_count)
+            total_latency += ceil(self.tiles[-1, -1, -1].K_reduction_latency)
 
         # 15. 返回总周期数
-        return total_cycle_count
+        return total_latency
     
     '''验证缓存容量是否足够'''
     def validate_cache_capacity(self):
@@ -421,7 +421,7 @@ class Chip_tile:
     """
     从芯片分块到 L1 上，910C有24个L1_tile和24个UB_tile。这里的逻辑要仔细想清楚，包括往L1的io读时间、从UB回来的io写时间、L2 cache机制等因素
     """
-    def __init__(self, base_address = None, strategy: 'MatMul_Strategy' = None, ):
+    def __init__(self, base_address = None, strategy: 'MatMul_Strategy' = None, M=None, N=None, K=None):
         # 下层结构数量与初始化
         self.L1_num = strategy.chip_type.AI_CORE_COUNT     # L1_num是L1_tile的数量，来自device信息超参数
         self.next_layers_L1 = [
@@ -442,9 +442,12 @@ class Chip_tile:
         # 约束 # 注意，这里同时要分左右矩阵，所以存储约束需要除以2
         self.size = strategy.chip_type.L1_CAPACITY                  # 芯片L1结构存储容量
         self.min_load_size = strategy.chip_type.MIN_ACCESS['Chip']  # 主存最小访存大小
-        self.M = strategy.chip_mnk_values[0] # 芯片层矩阵大小M
-        self.N = strategy.chip_mnk_values[1] # 芯片层矩阵大小N
-        self.K = strategy.chip_mnk_values[2] # 芯片层矩阵大小K
+        # self.M = strategy.chip_mnk_values[0] # 芯片层矩阵大小M
+        # self.N = strategy.chip_mnk_values[1] # 芯片层矩阵大小N
+        # self.K = strategy.chip_mnk_values[2] # 芯片层矩阵大小K
+        self.M = M # 芯片层矩阵大小M
+        self.N = N # 芯片层矩阵大小N
+        self.K = K # 芯片层矩阵大小K
         
         # 硬件约束
         self.core_count = strategy.chip_type.AI_CORE_COUNT
@@ -453,22 +456,23 @@ class Chip_tile:
         self.vector_flops_per_cycle = strategy.chip_type.VECTOR_FLOPS_PER_CYCLE
         self.systolic_input_word_size = strategy.chip_type.SYSTOLIC_INPUT_WORD_SIZE
         self.systolic_output_word_size = strategy.chip_type.SYSTOLIC_OUTPUT_WORD_SIZE
+        #芯片间数据传输速度chiplet_module.io_module.bandwidth
         self.io_bandwidth = strategy.chip_type.IO_BANDWIDTH
-        self.word_size = strategy.word_size
-
+        self.vector_flops = None #该参数待定！！！
         # 向上回传数据
-        self.K_reduction_cycle_count = ceil(
-            self.M * self.N / self.vector_flops_per_cycle
+        # vector_flops_per_cycle是什么,等于CUBE_MACS_PER_CYCLE吗???要改成vector_flops； chip_tile_bandwidth是什么???应该是主存到chip_tile的带宽
+        self.K_reduction_latency = ceil(
+            self.M * self.N / self.vector_flops
         ) + 2 * ceil(
-            self.M * self.N * self.word_size / self.l2_bandwidth_per_cycle
+            self.M * self.N * self.elem_bytes / self.chip_tile_bandwidth
         )
-        self.K_reduction_io_count = 2 * self.M * self.N * self.word_size
-        self.M_K_io_cycle_count = self._simulate_chip_tile_io_cycle_count(self.M, self.K)
-        self.K_N_io_cycle_count = self._simulate_chip_tile_io_cycle_count(self.K, self.N)
-        self.M_N_io_cycle_count = self._simulate_chip_tile_io_cycle_count(self.M, self.N)
-        self.compute_cycle_count = self._simulate_chip_tile_compute_cycle_count()
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.K_reduction_io_count = 2 * self.M * self.N * self.elem_bytes
+        self.M_K_io_latency = self._simulate_chip_tile_io_latency(self.M, self.K)
+        self.K_N_io_latency = self._simulate_chip_tile_io_latency(self.K, self.N)
+        self.M_N_io_latency = self._simulate_chip_tile_io_latency(self.M, self.N)
+        self.compute_latency = self._simulate_chip_tile_compute_latency()
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
         
     def calculate_cycles(self):
         core_cycles = []
@@ -492,15 +496,16 @@ class Chip_tile:
 
         return core_cycles
         
-    def _simulate_chip_tile_io_cycle_count(self, M: int, N: int) -> int:
+    def _simulate_chip_tile_io_latency(self, M: int, N: int) -> int:
         """计算IO传输周期数"""
+        #io_bandwidth 芯片间数据传输速度待确定？？？
         return ceil(
-            M * N * self.word_size / (
-                self.io_bandwidth / self.clock_freq
+            M * N * self.elem_bytes / (
+                self.io_bandwidth 
             )
         )
 
-    def _simulate_chip_tile_compute_cycle_count(self) -> int:
+    def _simulate_chip_tile_compute_latency(self) -> int:
         """核心计算周期模拟"""
         # 1. L1分块参数初始化
         M_l1_t = self.M // self.M_tile # M方向完整分块数  
@@ -600,7 +605,7 @@ class Chip_tile:
         prev_read_M_N = np.zeros([ceil(self.M/self.M_tile ), ceil(self.N/self.N_tile )], dtype=bool)
         # 记录前一批次C矩阵的存储位置
         prev_write_M_N = np.zeros([ceil(self.M/self.M_tile ), ceil(self.N/self.N_tile )], dtype=bool)
-        prev_compute_cycle_count = 0 # 前一批次计算周期
+        prev_compute_latency = 0 # 前一批次计算周期
         active_tile_list = [] # 用于临时存储当前批次待处理的L1分块
         
         # 分块循环调度
@@ -629,7 +634,7 @@ class Chip_tile:
             current_read_K_N = np.zeros_like(prev_read_K_N)
             current_read_M_N = np.zeros_like(prev_read_M_N)
             current_write_M_N = np.zeros_like(prev_write_M_N)
-            current_compute_cycle_count = 0
+            current_compute_latency = 0
             
             # 处理当前批次每个分块
             '''数据标记：通过布尔矩阵记录当前批次需要加载的A/B/C矩阵分块位置  
@@ -646,12 +651,12 @@ class Chip_tile:
                 current_write_M_N[temp_m, temp_n] = 1 # 所有分块需写回结果
                 
                 # 计算分块周期（含归约）
-                temp_l1_tile_compute_cycle_count = temp_l1_tile.compute_cycle_count
+                temp_l1_tile_compute_latency = temp_l1_tile.compute_latency
                 if temp_k > 0:
-                    temp_l1_tile_compute_cycle_count += ceil(
-                        temp_l1_tile.M * temp_l1_tile.N / self.vector_flops_per_cycle
+                    temp_l1_tile_compute_latency += ceil(
+                        temp_l1_tile.M * temp_l1_tile.N / self.vector_flops#！！！
                     )
-                current_compute_cycle_count = max(current_compute_cycle_count, temp_l1_tile_compute_cycle_count)
+                current_compute_latency = max(current_compute_latency, temp_l1_tile_compute_latency)
             
             # 数据依赖分析
             '''增量加载：~previous_batch_Read_*排除已缓存数据
@@ -681,22 +686,22 @@ class Chip_tile:
 
                     带宽计算：数据量 ÷ L2带宽（考虑输入/输出字宽差异）'''
             # 计算当前批次加载周期
-            current_batch_read_cycle_count = ceil(
+            current_batch_read_latency = ceil(
                 (curr_M_K_read_count + curr_K_N_read_count + curr_M_N_read_count) * 
                 self.systolic_input_word_size / self.l2_bandwidth_per_cycle
             )
             # 计算前批次写回周期
-            previous_batch_write_cycle_count = ceil(
+            previous_batch_write_latency = ceil(
                 prev_M_N_write_count * self.systolic_output_word_size / self.l2_bandwidth_per_cycle
             )
-            total_cycle += max(
-                current_batch_read_cycle_count,  # 当前批次加载时间
-                prev_compute_cycle_count                # 前批次计算时间
-                ) + previous_batch_write_cycle_count # 前批次写回时间
+            total_latency += max(
+                current_batch_read_latency,  # 当前批次加载时间
+                prev_compute_latency                # 前批次计算时间
+                ) + previous_batch_write_latency # 前批次写回时间
             
             # 状态更新
             # 保存当前批次状态用于下次迭代
-            prev_compute_cycle_count = current_compute_cycle_count
+            prev_compute_latency = current_compute_latency
             prev_read_M_K = copy.deepcopy(current_read_M_K)
             prev_read_K_N = copy.deepcopy(current_read_K_N)
             prev_read_M_N = copy.deepcopy(current_read_M_N)
@@ -705,15 +710,15 @@ class Chip_tile:
             active_tile_list = []
         
         # 尾部处理
-        total_cycle += (
-            prev_compute_cycle_count +
+        total_latency += (
+            prev_compute_latency +
             ceil(
-                np.sum(prev_write_M_N * M_N_tile_size) * self.word_size /
+                np.sum(prev_write_M_N * M_N_tile_size) * self.elem_bytes /
                 self.l2_bandwidth_per_cycle
             )
         )
         
-        return total_cycle
+        return total_latency
 
     def _create_l1_tile(self, M, N, K) -> 'L1_tile':
         """创建L1分块实例"""
@@ -770,7 +775,7 @@ class L1_tile:
     """
     从 L1 分块到 L0 上。注意一个L1对应两个L0，因此在写约束的时候注意要把约束除以2；L2 cache机制也要考虑，不过不要和Chip层重复计算
     """
-    def __init__(self, id, strategy: 'MatMul_Strategy' = None):
+    def __init__(self, id, strategy: 'MatMul_Strategy' = None, M=None, N=None, K=None):
         # 本层结构编号
         self.L1_id = id
         self.elem_bytes = strategy.elem_bytes # 字节数
@@ -793,19 +798,22 @@ class L1_tile:
         self.min_load_size= strategy.chip_type.MIN_ACCESS['L1']  # L1 buffer最小访存大小
           # 注意，由于在L1层关心L0层容量，所以这里没有用if来区分L0A和L0B，后面需要修改一下
           # 同时，由于这里分块只关系L0A和L0B，所以没有考虑L0C的约束，需要另作考虑
-        self.M = strategy.L1_mnk_values[0] # L1 buffer层矩阵大小M
-        self.N = strategy.L1_mnk_values[1] # L1 buffer层矩阵大小N
-        self.K = strategy.L1_mnk_values[2] # L1 buffer层矩阵大小K        
+        # self.M = strategy.L1_mnk_values[0] # L1 buffer层矩阵大小M
+        # self.N = strategy.L1_mnk_values[1] # L1 buffer层矩阵大小N
+        # self.K = strategy.L1_mnk_values[2] # L1 buffer层矩阵大小K      
+        self.M = M # L1 buffer层矩阵大小M
+        self.N = N # L1 buffer层矩阵大小N
+        self.K = K # L1 buffer层矩阵大小K  
 
         # 向上回传数据
-        self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
+        self.K_reduction_latency = None # 结果矩阵拼接耗时
         #self.K_reduction_io_count = None
-        self.M_K_io_cycle_count = None      # 左矩阵传入耗时
-        self.K_N_io_cycle_count = None      # 右矩阵传入耗时
-        self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.M_K_io_latency = None      # 左矩阵传入耗时
+        self.K_N_io_latency = None      # 右矩阵传入耗时
+        self.M_N_io_latency = None      # 结果矩阵传出耗时
+        self.compute_latency = None     # 内层计算耗时
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -857,14 +865,14 @@ class L0_tile:
         self.K = strategy.L0_mnk_values[2] # L0层矩阵大小K
 
         # 向上回传数据
-        self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
+        self.K_reduction_latency = None # 结果矩阵拼接耗时
         #self.K_reduction_io_count = None
-        self.M_K_io_cycle_count = None      # 左矩阵传入耗时
-        self.K_N_io_cycle_count = None      # 右矩阵传入耗时
-        self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.M_K_io_latency = None      # 左矩阵传入耗时
+        self.K_N_io_latency = None      # 右矩阵传入耗时
+        self.M_N_io_latency = None      # 结果矩阵传出耗时
+        self.compute_latency = None     # 内层计算耗时
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -884,7 +892,7 @@ class L0_tile:
 
 class AB_DFF_tile:
     """
-    寄存器上的结构运算。注意在计算compute_cycle_count的时候，注意在AB_DFF_tile与Accum_DFF_tile之间的不要重复计算
+    寄存器上的结构运算。注意在计算compute_latency的时候，注意在AB_DFF_tile与Accum_DFF_tile之间的不要重复计算
     """
     def __init__(self, strategy: 'MatMul_Strategy' = None):
         # 约束
@@ -896,14 +904,14 @@ class AB_DFF_tile:
         self.storage_formats = strategy.DFF_storage_formats # 存储格式，在本层可能有点用
 
         # 向上回传数据
-        self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
+        self.K_reduction_latency = None # 结果矩阵拼接耗时
         #self.K_reduction_io_count = None
-        self.M_K_io_cycle_count = None      # 左矩阵传入耗时
-        self.K_N_io_cycle_count = None      # 右矩阵传入耗时
-        self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.M_K_io_latency = None      # 左矩阵传入耗时
+        self.K_N_io_latency = None      # 右矩阵传入耗时
+        self.M_N_io_latency = None      # 结果矩阵传出耗时
+        self.compute_latency = None     # 内层计算耗时
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
 
     def calculate_cycles(self):
         # 寄存器之间的数据搬运似乎不需要占用计算周期
@@ -936,14 +944,14 @@ class UB_tile:
         self.K = strategy.L1_mnk_values[2] # L1 buffer层矩阵大小K        
 
         # 向上回传数据
-        self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
+        self.K_reduction_latency = None # 结果矩阵拼接耗时
         #self.K_reduction_io_count = None
-        self.M_K_io_cycle_count = None      # 左矩阵传入耗时
-        self.K_N_io_cycle_count = None      # 右矩阵传入耗时
-        self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.M_K_io_latency = None      # 左矩阵传入耗时
+        self.K_N_io_latency = None      # 右矩阵传入耗时
+        self.M_N_io_latency = None      # 结果矩阵传出耗时
+        self.compute_latency = None     # 内层计算耗时
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -977,14 +985,14 @@ class L0C_tile:
         self.K = strategy.L0_mnk_values[2] # L0层矩阵大小K
 
         # 向上回传数据
-        self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
+        self.K_reduction_latency = None # 结果矩阵拼接耗时
         #self.K_reduction_io_count = None
-        self.M_K_io_cycle_count = None      # 左矩阵传入耗时
-        self.K_N_io_cycle_count = None      # 右矩阵传入耗时
-        self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.M_K_io_latency = None      # 左矩阵传入耗时
+        self.K_N_io_latency = None      # 右矩阵传入耗时
+        self.M_N_io_latency = None      # 结果矩阵传出耗时
+        self.compute_latency = None     # 内层计算耗时
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
 
     def calculate_cycles(self):
         """
@@ -1010,14 +1018,14 @@ class Accum_DFF_tile:
         self.storage_formats = strategy.DFF_storage_formats # 存储格式，在本层可能有点用
 
         # 向上回传数据
-        self.K_reduction_cycle_count = None # 结果矩阵拼接耗时
+        self.K_reduction_latency = None # 结果矩阵拼接耗时
         #self.K_reduction_io_count = None
-        self.M_K_io_cycle_count = None      # 左矩阵传入耗时
-        self.K_N_io_cycle_count = None      # 右矩阵传入耗时
-        self.M_N_io_cycle_count = None      # 结果矩阵传出耗时
-        self.compute_cycle_count = None     # 内层计算耗时
-        self.mem_alloc_read_cycle_count = None   # 内存分配耗时
-        self.mem_alloc_write_cycle_count = None  # 内存分配耗时
+        self.M_K_io_latency = None      # 左矩阵传入耗时
+        self.K_N_io_latency = None      # 右矩阵传入耗时
+        self.M_N_io_latency = None      # 结果矩阵传出耗时
+        self.compute_latency = None     # 内层计算耗时
+        self.mem_alloc_read_latency = None   # 内存分配耗时
+        self.mem_alloc_write_latency = None  # 内存分配耗时
 
     def calculate_cycles(self):
         # 同AB_DFF

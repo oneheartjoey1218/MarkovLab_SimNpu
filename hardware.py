@@ -12,7 +12,7 @@ class HardwareSpec:
         # 最小访存粒度 (bytes)
         self.MIN_ACCESS = {
             'Chip': 2,
-            'L2': 2,
+            'L2': 512,
             'L1': 32,
             'L0A': 512,
             'L0B': 512,
@@ -36,6 +36,8 @@ class HardwareSpec:
         self.AccumDFF_CAPACITY = 512      # Accum DFF 寄存器【实际大小未知，还得去找华为要】
 
         # IO 带宽
+        #还需要profiling数据！
+        #DRAM→L2 UB→DRAM DRAM→L1（第一次可能不会触发缓存）
         self.IO_BW = { # 【这里应该加一个DRAM→L1 的带宽】【网上号称昇腾的主存是HBM，带宽达到1.2TB/s，但是哪一段的带宽不得而知】
             'DRAM→L2': 1024,
             'L2→L1': self.MIN_ACCESS['L1'],
