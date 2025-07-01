@@ -63,7 +63,62 @@ class SetAssociativeCache:
             way.pop(0)
         way.append(block_no)
         return False
+    
+class InputOutputL2Cache:
+    """按输入/输出划分的 L2 Cache容量, 替换逻辑相同"""
+    def __init__(self,
+                 total_capacity: int,
+                 input_ratio: float,
+                 block_size: int,
+                 assoc: int):
+        # 按比例划分容量
+        input_cap  = int(total_capacity * input_ratio)
+        output_cap = total_capacity - input_cap
+        # 分别构建两段 Set-Associative Cache
+        self.input_cache  = SetAssociativeCache(input_cap,  block_size, assoc)
+        self.output_cache = SetAssociativeCache(output_cap, block_size, assoc)
+        self.block_size   = block_size
+        # 用于累积来自 L0C 的各个部分写回大小
+        self.pending_writes: list[int] = []
 
+    def read(self, address: int, size: int) -> float:
+        total = 0.0
+        lines = (size + self.block_size - 1) // self.block_size
+        for i in range(lines):
+            addr = address + i * self.block_size
+            if self.input_cache.access(addr):
+                # L2 命中路径：L2→L1
+                total += device.io.load(self.block_size, 'L2', 'L1')
+            else:
+                # L2 未命中：DRAM→L2 + L2→L1
+                total += device.io.load(self.block_size, 'DRAM', 'L2')
+                total += device.io.load(self.block_size, 'L2',   'L1')
+        return total
+    
+    def write(self, size: int) -> float:
+            """
+            缓存写回：只把本次块大小累积到 pending_writes，不立刻发 DRAM
+            """
+            self.pending_writes.append(size)
+            return 0.0
+
+    def flush(self) -> float:
+            """
+            一次性把所有 pending_writes 拼成一个连续大块，通过 L2->DRAM DMA 写回，清空 pending_writes
+            """
+            if not self.pending_writes:
+                return 0.0
+            total_size = sum(self.pending_writes)
+            # 对齐到 MIN_ACCESS['L2']
+            from modules import align
+            aligned = align(total_size, HW.MIN_ACCESS['L2'])
+            # 发起一次大 DMA
+            cycles = device.io.store(aligned, 'L2', 'DRAM')       
+            self.pending_writes.clear()
+            return cycles
+
+'''
+# 旧L2Cache实现，暂时不删以防万一
 class L2Cache:
     """单核 L2 Cache，集合关联命中模型"""
     def __init__(self):
@@ -91,17 +146,30 @@ class L2Cache:
     def write(self, size: int) -> float:
         # 分配策略
         return 0.0
-    
+'''
+
 class L2CacheManager:
-    # L2 Cache 管理器，按 core_id 分配单核 Cache
+    """L2 Cache 管理器，按 core_id 分配分段管理的 L2 Cache"""
     def __init__(self, num_cores: int):
-        self.caches = {i: L2Cache() for i in range(num_cores)}
+        self.caches = {
+            i: InputOutputL2Cache(
+                total_capacity = HW.L2_CAPACITY,
+                input_ratio    = HW.L2_INPUT_RATIO,
+                block_size     = HW.MIN_ACCESS['L2'],
+                assoc          = HW.L2_ASSOCIATIVITY
+            )
+            for i in range(num_cores)
+        }
 
     def read(self, core_id: int, address: int, size: int) -> float:
         return self.caches[core_id].read(address, size)
 
     def write(self, core_id: int, size: int) -> float:
         return self.caches[core_id].write(size)
+    
+    def flush(self, core_id: int) -> float:
+        # 触发 core_id 对应 L2Cache 的一次性拼接写回
+        return self.caches[core_id].flush()
     
 # 全局多核 L2 Cache 管理器
 L2_CACHE_MGR = L2CacheManager(HW.AI_CORE_COUNT)   

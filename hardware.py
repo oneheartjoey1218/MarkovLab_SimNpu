@@ -24,8 +24,8 @@ class HardwareSpec:
         }
 
         # 每层的缓存容量
-        self.MEM_CAPACITY = 128 * 1024**3 # Chip，910C为128GB【数据来自网络，不保证准确】
-        self.L2_CAPACITY = 32 * 1024**2   # L2
+        self.MEM_CAPACITY = 64 * 1024**3 # Chip，910C为128GB【数据来自网络，不保证准确】
+        self.L2_CAPACITY = 192 * 1024**2   # L2
         self.L1_CAPACITY = 1 * 1024**2    # L1
         self.L0A_CAPACITY = 64 * 1024     # L0A
         self.L0B_CAPACITY = 64 * 1024     # L0B
@@ -56,5 +56,8 @@ class HardwareSpec:
         # 暂时未知的超参数
         # L2 Cache 相联度 
         self.L2_ASSOCIATIVITY = 8
+        # L2 输入输出容量划分比例
+        self.L2_INPUT_RATIO = 0.8
+        
 
 HW = HardwareSpec()

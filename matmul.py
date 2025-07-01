@@ -42,7 +42,22 @@ def split_blocks(blocks, max_elems):
 
 
 class MatMul_Strategy:
-    def __init__(self, dataflow_mode, raw_mnk_values, raw_storage_formats, option, chip_type:'HardwareSpec' = HW):
+    L2_mnk_values       = None
+    L1_mnk_values       = None
+    L0_mnk_values       = None
+    DFF_mnk_values      = None
+
+    L2_block_strategy   = None
+    L1_block_strategy   = None
+    L0_block_strategy   = None
+    DFF_block_strategy  = None
+
+    L2_storage_formats  = None
+    L1_storage_formats  = None
+    L0_storage_formats  = None
+    DFF_storage_formats = None
+    
+    def __init__(self, dataflow_mode, raw_mnk_values, raw_storage_formats, option=None, chip_type:'HardwareSpec' = HW):
         """
         Initialize the strategy with dataflow mode, raw MNK values, and raw storage formats.
         """
@@ -53,9 +68,11 @@ class MatMul_Strategy:
         self.elem_bytes = 2 if 'fp16' in raw_storage_formats else 4 # 这行是哪来的？我不知道
 
         # 暂时初始化其余属性
-        self.chip_mnk_values = None
-        self.chip_storage_formats = None # 字符串列表：[左矩阵格式,右矩阵格式]
+        self.chip_mnk_values = list(self.raw_mnk_values)  # 芯片分块的MNK值，数据格式为列表：[M, N, K]
+        self.chip_storage_formats = list(self.raw_storage_format) # 字符串列表：[左矩阵格式,右矩阵格式]
         self.chip_block_strategy = None # 分块策略，包括内积法（沿M轴和N轴切分）、外积法（沿K轴切分）、内外积结合（都切分，得算两次）
+        if option is None:
+            return
         
         self.L1_mnk_values = None       # L1与UB通用
         self.L1_storage_formats = None # 字符串列表：[左矩阵格式,右矩阵格式]
@@ -374,7 +391,7 @@ class Simulate:
             K_tile=K,
             next_layer=None,  # 根据实际情况设置
             block_strategy=self.block_strategy,
-            storage_format=self.storage_format
+            storage_format=self.storage_formats
         )
 
     '''生成遍历分块的循环顺序'''
@@ -491,9 +508,13 @@ class Chip_tile:
             t3 += _device.io.store(size_C, 'AccumDFF', 'L0C')   
             # 4) L0C-UB
             t4 = _device.io.load(size_C, 'L0C', 'UB')
-            
-            core_cycles.append(t1 + t2 + t3 + t4)
-
+            # 5) 缓存本次 C 矩阵块到 L2 输出段
+            t5 = L2_CACHE_MGR.write(core, size_C)
+            core_cycles.append(t1 + t2 + t3 + t4 + t5)
+        # 等所有 core 的块都累积到 L2 了，下一步统一 flush
+        for core in range(self.L1_num):
+            t_flush = L2_CACHE_MGR.flush(core)
+            core_cycles[core] += t_flush
         return core_cycles
         
     def _simulate_chip_tile_io_latency(self, M: int, N: int) -> int:
