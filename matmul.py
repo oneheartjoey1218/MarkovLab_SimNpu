@@ -148,6 +148,9 @@ class Simulate:
         """
             strategy先在外部调用matmul_strategy生成，生成策略后传入Simulate类的实例中
         """
+        # 保存 strategy 对象!!!
+        self.strategy = strategy
+
         # 下层结构初始化
         self.next_layer = Chip_tile(strategy=strategy) # next_layer是Chip_tile实例，把策略传递进去
 
@@ -346,7 +349,7 @@ class Simulate:
             self.M_tile * self.N_tile + 
             self.N_tile * self.K_tile + 
             self.M_tile * self.K_tile
-        ) * self.elem_bytes
+        ) * self.strategy.elem_bytes
         
         # 获取可用的缓存容量 L2_CAPACITY!
         available_cache = HW.L2_CAPACITY
@@ -439,6 +442,8 @@ class Chip_tile:
     从芯片分块到 L1 上，910C有24个L1_tile和24个UB_tile。这里的逻辑要仔细想清楚，包括往L1的io读时间、从UB回来的io写时间、L2 cache机制等因素
     """
     def __init__(self, base_address = None, strategy: 'MatMul_Strategy' = None, M=None, N=None, K=None):
+        # 保存 strategy 对象!!!
+        self.strategy = strategy
         # 下层结构数量与初始化
         self.L1_num = strategy.chip_type.AI_CORE_COUNT     # L1_num是L1_tile的数量，来自device信息超参数
         self.next_layers_L1 = [
@@ -468,22 +473,25 @@ class Chip_tile:
         
         # 硬件约束
         self.core_count = strategy.chip_type.AI_CORE_COUNT
-        self.l2_bandwidth_per_cycle = strategy.chip_type.L2_BANDWIDTH # 需要在hardware.py中定义 #没找到
+        #换self.l2_bandwidth_per_cycle = strategy.chip_type.L2_BANDWIDTH 
+        self.DRAM_to_l2_bandwidth = strategy.chip_type.IO_BW['DRAM→L2']
         self.clock_freq = strategy.chip_type.CLOCK_FREQ
         self.vector_flops_per_cycle = strategy.chip_type.VECTOR_FLOPS_PER_CYCLE
-        self.systolic_input_word_size = strategy.chip_type.SYSTOLIC_INPUT_WORD_SIZE
-        self.systolic_output_word_size = strategy.chip_type.SYSTOLIC_OUTPUT_WORD_SIZE
+        #这些先不要，目前认为没有，用elem_bytes!!!
+        # self.systolic_input_word_size = strategy.chip_type.SYSTOLIC_INPUT_WORD_SIZE
+        # self.systolic_output_word_size = strategy.chip_type.SYSTOLIC_OUTPUT_WORD_SIZE
         #芯片间数据传输速度chiplet_module.io_module.bandwidth
-        self.io_bandwidth = strategy.chip_type.IO_BANDWIDTH
+        #获取到 外部 到 DRAM 的带宽值！
+        self.io_bandwidth = strategy.chip_type.IO_BW['OUTSIDE→DRAM']
         self.vector_flops = None #该参数待定！！！
         # 向上回传数据
         # vector_flops_per_cycle是什么,等于CUBE_MACS_PER_CYCLE吗???要改成vector_flops； chip_tile_bandwidth是什么???应该是主存到chip_tile的带宽
         self.K_reduction_latency = ceil(
             self.M * self.N / self.vector_flops
         ) + 2 * ceil(
-            self.M * self.N * self.elem_bytes / self.chip_tile_bandwidth
+            self.M * self.N * self.strategy.elem_bytes / self.chip_tile_bandwidth
         )
-        self.K_reduction_io_count = 2 * self.M * self.N * self.elem_bytes
+        self.K_reduction_io_count = 2 * self.M * self.N * self.strategy.elem_bytes
         self.M_K_io_latency = self._simulate_chip_tile_io_latency(self.M, self.K)
         self.K_N_io_latency = self._simulate_chip_tile_io_latency(self.K, self.N)
         self.M_N_io_latency = self._simulate_chip_tile_io_latency(self.M, self.N)
@@ -493,9 +501,9 @@ class Chip_tile:
         
     def calculate_cycles(self):
         core_cycles = []
-        size_A = self.M_tile * self.K_tile * self.elem_bytes
-        size_B = self.K_tile * self.N_tile * self.elem_bytes
-        size_C = self.M_tile * self.N_tile * self.elem_bytes
+        size_A = self.M_tile * self.K_tile * self.strategy.elem_bytes
+        size_B = self.K_tile * self.N_tile * self.strategy.elem_bytes
+        size_C = self.M_tile * self.N_tile * self.strategy.elem_bytes
         for core in range(self.L1_num):
             # 1) DRAM-L2-L1，传入真实基地址
             addr_A, addr_B = self.base_addresses[core]
@@ -521,7 +529,7 @@ class Chip_tile:
         """计算IO传输周期数"""
         #io_bandwidth 芯片间数据传输速度待确定？？？
         return ceil(
-            M * N * self.elem_bytes / (
+            M * N * self.strategy.elem_bytes / (
                 self.io_bandwidth 
             )
         )
@@ -691,6 +699,9 @@ class Chip_tile:
             curr_K_N_read_count = np.sum(
                 (current_read_K_N * (~prev_read_K_N)) * K_N_tile_size
             )
+            #假设在一个分块矩阵乘法的计算中，每次只计算一部分结果，然后把这些结果累加到结果矩阵 C 上。
+            # 在计算下一个分块之前，需要读取结果矩阵 C 中对应的部分，和当前计算得到的结果相加。
+            # 这种情况下，就会出现读取矩阵 C 的操作！！！???这块需要确定到底有没有！！！
             curr_M_N_read_count = np.sum(
                 (current_read_M_N * (~(prev_read_M_N + prev_write_M_N))) * M_N_tile_size
             )
@@ -706,20 +717,51 @@ class Chip_tile:
                     写回串行：必须等前批次计算完成才能写回
 
                     带宽计算：数据量 ÷ L2带宽（考虑输入/输出字宽差异）'''
-            # 计算当前批次加载周期
-            current_batch_read_latency = ceil(
-                (curr_M_K_read_count + curr_K_N_read_count + curr_M_N_read_count) * 
-                self.systolic_input_word_size / self.l2_bandwidth_per_cycle
-            )
+            # # 计算当前批次加载周期
+            # current_batch_read_latency = ceil(
+            #     (curr_M_K_read_count + curr_K_N_read_count + curr_M_N_read_count) * 
+            #     self.strategy.elem_bytes / self.DRAM_to_l2_bandwidth
+            # )
             # 计算前批次写回周期
-            previous_batch_write_latency = ceil(
-                prev_M_N_write_count * self.systolic_output_word_size / self.l2_bandwidth_per_cycle
-            )
+            # previous_batch_write_latency = ceil(
+            #     prev_M_N_write_count * self.strategy.elem_bytes / self.DRAM_to_l2_bandwidth
+            # )
+            # total_latency += max(
+            #     current_batch_read_latency,  # 当前批次加载时间
+            #     prev_compute_latency                # 前批次计算时间
+            #     ) + previous_batch_write_latency # 前批次写回时间
+
+
+            #???按这个代码的逻辑这里core的id应该不需要，2人的代码需要选取一个逻辑
+            addr_A, addr_B = self.base_addresses[core]
+            addr_C = self.base_addresses[core]#???暂时假设一下
+
+            size_A = curr_M_K_read_count * self.strategy.elem_bytes
+            size_B = curr_K_N_read_count * self.strategy.elem_bytes
+            size_C = curr_M_N_read_count * self.strategy.elem_bytes
+            # 1) DRAM-L2-L1，传入真实基地址
+            T1 = L2_CACHE_MGR.read(core, addr_A, size_A) 
+            + L2_CACHE_MGR.read(core, addr_B, size_B)+L2_CACHE_MGR.read(core, addr_C, size_C)
+            # 2) L1-L0A/L0B
+            T2 = max(_device.io.load(size_A, 'L1', 'L0A'), 
+                     _device.io.load(size_B, 'L1', 'L0B'))
+        
+            current_batch_read_latency=T1+T2
+            # 上批次的compute
+            # 3) Cube-AccumDFF-L0C
+            T3 = _device.io.store(size_C, 'AccumDFF', 'L0C') 
+            # 4) L0C-UB
+            T4 = _device.io.load(size_C, 'L0C', 'UB')
+            # 5) 缓存本次 C 矩阵块到 L2 输出段
+            T5 = L2_CACHE_MGR.write(core, size_C)
+            previous_batch_write_latency=T3+T4+T5
+            
             total_latency += max(
                 current_batch_read_latency,  # 当前批次加载时间
                 prev_compute_latency                # 前批次计算时间
                 ) + previous_batch_write_latency # 前批次写回时间
             
+
             # 状态更新
             # 保存当前批次状态用于下次迭代
             prev_compute_latency = current_compute_latency
@@ -730,14 +772,17 @@ class Chip_tile:
             # 清空当前批次
             active_tile_list = []
         
-        # 尾部处理
+        # 尾部处理 可能也要修改???
         total_latency += (
             prev_compute_latency +
             ceil(
-                np.sum(prev_write_M_N * M_N_tile_size) * self.elem_bytes /
-                self.l2_bandwidth_per_cycle
-            )
-        )
+                np.sum(prev_write_M_N * M_N_tile_size) * self.strategy.elem_bytes /
+                self.DRAM_to_l2_bandwidth
+        ))
+        #???统一 flush的操作，还需要修改
+        t_flush = L2_CACHE_MGR.flush(core)
+        total_latency += t_flush
+        
         
         return total_latency
 
@@ -799,7 +844,7 @@ class L1_tile:
     def __init__(self, id, strategy: 'MatMul_Strategy' = None, M=None, N=None, K=None):
         # 本层结构编号
         self.L1_id = id
-        self.elem_bytes = strategy.elem_bytes # 字节数
+        self.strategy=strategy
         
         # 下层结构初始化
         self.L0_num = 2                 # L0_num是L0_tile的数量，理论上也来自超参数，不过这边就直接在这初始化了
@@ -842,8 +887,8 @@ class L1_tile:
         需要考虑分块策略（在最前面用self.block_strategy区分计算路径）
         """
         # L1 to L0A/B
-        size_A = self.M_tile * self.K_tile * self.elem_bytes
-        size_B = self.K_tile * self.N_tile * self.elem_bytes
+        size_A = self.M_tile * self.K_tile * self.strategy.elem_bytes
+        size_B = self.K_tile * self.N_tile * self.strategy.elem_bytes
         if size_A > HW.L0A_CAPACITY:
             raise ValueError(f"L0A overflow: {size_A} > {HW.L0A_CAPACITY}")
         if size_B > HW.L0B_CAPACITY:
@@ -865,7 +910,7 @@ class L0_tile:
     def __init__(self, id, strategy: 'MatMul_Strategy' = None):
         # 本层结构编号
         self.L0_id = id
-        self.elem_bytes = strategy.elem_bytes # 字节数
+        self.strategy = strategy
         
         # 下层结构初始化
         self.next_layer = AB_DFF_tile(strategy=strategy) # next_layer是DFF_tile实例，把策略传递进去
@@ -905,7 +950,7 @@ class L0_tile:
         # Cube 计算
         cube_cycles = _device.compute.compute(self.M_tile, self.N_tile, self.K_tile)
         # 从 AccumDFF 写回L0C
-        size_C = self.M_tile * self.N_tile * self.elem_bytes
+        size_C = self.M_tile * self.N_tile * self.strategy.elem_bytes
         io_cycles = _device.io.store(size_C, 'AccumDFF', 'L0C')
         total = cube_cycles + io_cycles
         return total
@@ -916,6 +961,8 @@ class AB_DFF_tile:
     寄存器上的结构运算。注意在计算compute_latency的时候，注意在AB_DFF_tile与Accum_DFF_tile之间的不要重复计算
     """
     def __init__(self, strategy: 'MatMul_Strategy' = None):
+        # 保存 strategy 对象!!!
+        self.strategy = strategy
         # 约束
         self.size = strategy.chip_type.ABDFF_CAPACITY               # DFF结构存储容量【通常来说应该要用更下层的容量做约束，但这已经是最底层了，我就先写着了】
         self.min_load_size = strategy.chip_type.MIN_ACCESS['ABDFF'] # DFF的最小访存大小
@@ -944,6 +991,8 @@ class UB_tile:
     从 UnifyBuffer 分块到 L0C 上
     """
     def __init__(self, id, strategy: 'MatMul_Strategy' = None):
+        # 保存 strategy 对象!!!
+        self.strategy = strategy
         # 本层结构编号
         self.UB_id = id
         
@@ -989,7 +1038,7 @@ class L0C_tile:
     def __init__(self, strategy: 'MatMul_Strategy' = None):
         # 下层结构初始化
         self.next_layer = Accum_DFF_tile(strategy=strategy) # next_layer是Accum_DFF_tile实例，把策略传递进去
-        self.elem_bytes = strategy.elem_bytes # 字节数
+        self.strategy = strategy
 
         # 决策变量
         self.M_tile = strategy.DFF_mnk_values[0]
@@ -1020,7 +1069,7 @@ class L0C_tile:
         Calculate the cycles for the current layer.
         """
         # 结果矩阵字节数
-        size_C = self.M_tile * self.N_tile * self.elem_bytes
+        size_C = self.M_tile * self.N_tile * self.strategy.elem_bytes
         # 从L0C 到 UB
         loc_cycles = _device.io.store(size_C, 'L0C', 'UB')
         return loc_cycles
@@ -1030,6 +1079,8 @@ class Accum_DFF_tile:
     寄存器上的结构运算
     """
     def __init__(self, strategy: 'MatMul_Strategy' = None):
+        # 保存 strategy 对象!!!
+        self.strategy = strategy
         # 约束
         self.size = strategy.chip_type.AccumDFF_CAPACITY               # DFF结构存储容量【通常来说应该要用更下层的容量做约束，但这已经是最底层了，我就先写着了】
         self.min_load_size = strategy.chip_type.MIN_ACCESS['AccumDFF'] # DFF的最小访存大小

@@ -39,6 +39,7 @@ class HardwareSpec:
         #还需要profiling数据！
         #DRAM→L2 UB→DRAM DRAM→L1（第一次可能不会触发缓存）
         self.IO_BW = { # 【这里应该加一个DRAM→L1 的带宽】【网上号称昇腾的主存是HBM，带宽达到1.2TB/s，但是哪一段的带宽不得而知】
+            'OUTSIDE→DRAM': 999999, #待定？
             'DRAM→L2': 1024,
             'L2→L1': self.MIN_ACCESS['L1'],
             'L1→L0A': self.MIN_ACCESS['L0A'],
@@ -58,6 +59,16 @@ class HardwareSpec:
         self.L2_ASSOCIATIVITY = 8
         # L2 输入输出容量划分比例
         self.L2_INPUT_RATIO = 0.8
+
+        
+        
+        # 新增：指令时长表！！！
+        # 表中的内容先把字段写了，具体数值等profiling数据出来后填上去
+        self.INSTRUCTION_TIME = {
+            'compute': None,
+            'load': None,
+            'store': None
+        }
         
 
 HW = HardwareSpec()

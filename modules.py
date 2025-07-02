@@ -9,6 +9,15 @@ class ComputeModule:
     def compute(self, M: int, N: int, K: int) -> float:
         """执行 M×K × K×N 矩阵乘，返回周期数"""
         return (M * N * K) / HW.CUBE_MACS_PER_CYCLE
+    
+    # 新增：使用指令时长表的计算方法！
+    def compute_with_time_table(self, M: int, N: int, K: int) -> float:
+        """执行 M×K × K×N 矩阵乘，从指令时长表中获取时间，若表中无数据则使用原方法计算"""
+        instruction_time = HW.INSTRUCTION_TIME['compute']
+        if instruction_time is None:
+            return self.compute(M, N, K)
+        else:
+            return instruction_time
 
 class IOModule:
     def load(self, size: int, src: str, dst: str) -> float:
@@ -21,6 +30,24 @@ class IOModule:
     def store(self, size_bytes: int, src: str, dst: str) -> float:
         """模拟 src->dst 的 DMA（写回），返回周期"""
         return self.load(size_bytes, src, dst)
+    
+    # 新增：使用指令时长表的加载方法！
+    def load_with_time_table(self, size: int, src: str, dst: str) -> float:
+        """模拟 src->dst 的 DMA，从指令时长表中获取时间，若表中无数据则使用原方法计算"""
+        instruction_time = HW.INSTRUCTION_TIME['load']
+        if instruction_time is None:
+            return self.load(size, src, dst)
+        else:
+            return instruction_time
+        
+    # 新增：使用指令时长表的存储方法！
+    def store_with_time_table(self, size_bytes: int, src: str, dst: str) -> float:
+        """模拟 src->dst 的 DMA（写回），从指令时长表中获取时间，若表中无数据则使用原方法计算"""
+        instruction_time = HW.INSTRUCTION_TIME['store']
+        if instruction_time is None:
+            return self.store(size_bytes, src, dst)
+        else:
+            return instruction_time
 
 class MemoryModule:
     def alloc(self, size_bytes: int):
