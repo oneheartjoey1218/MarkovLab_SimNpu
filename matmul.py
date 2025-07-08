@@ -139,7 +139,7 @@ class MatMul_Strategy:
         # 本层无计算
         return 0
     
-    
+
 class Simulate:
     """
     从原始矩阵分块到芯片上
@@ -174,6 +174,13 @@ class Simulate:
         self.compute_latency = None     # 内层计算耗时
         self.mem_alloc_read_latency = None   # 内存分配耗时
         self.mem_alloc_write_latency = None  # 内存分配耗时
+       
+    # 按流水线方式计算周期数，占位 
+    def calculate_pipelined_cycles(self) -> int:
+        self.calculate_cycles()
+        scheduler = PipelineScheduler(self)
+        return scheduler.simulate()
+
 
     def calculate_cycles(self):
         """
@@ -433,6 +440,174 @@ class Simulate:
                 for n in range(N_tiles):
                     for k in range(K_tiles):
                         yield m, n, k
+
+
+
+class PipelineTileState:
+    """
+    追踪每个 tile 在六个流水阶段（0=OUT2,1=OUT1,2=FIX,3=MTE2,4=MTE1,5=M）的状态。
+    """
+    def __init__(self, coord):
+        self.coord = coord
+        self.current_stage = 0
+        self.remaining_cycles = 0
+        self.completed_stages = set()
+
+    def is_stage_completed(self, stage_id):
+        return stage_id in self.completed_stages
+
+    def start_stage(self, stage_id, duration):
+        self.current_stage = stage_id
+        self.remaining_cycles = duration
+
+    def step(self):
+        if self.remaining_cycles > 0:
+            self.remaining_cycles -= 1
+            if self.remaining_cycles == 0:
+                self.completed_stages.add(self.current_stage)
+                return True
+        return False
+
+
+class PipelineScheduler:
+    """
+    支持 24-core 并行的六层流水线调度器
+    """
+    def __init__(self, sim):
+        # sim: Simulate 实例
+        self.sim = sim
+        self.chip_tiles = sim.tiles
+        self.states     = {}
+        self.cycle      = 0
+        # Sflag延迟，目前未知保留为0
+        self.flag_delay = getattr(sim, 'flag_delay', 0)
+        # 记录每层上一次调度的 tile 坐标，用于 A/B 重用判断
+        self.prev_coord = [None] * 6
+
+        M, N, K = sim.M, sim.N, sim.K
+        mt, nt, kt = sim.M_tile, sim.N_tile, sim.K_tile
+        self.M_tiles = ceil(M / mt)
+        self.N_tiles = ceil(N / nt)
+        self.K_tiles = ceil(K / kt)
+
+        for m in range(self.M_tiles):
+            for n in range(self.N_tiles):
+                for k in range(self.K_tiles):
+                    self.states[(m, n, k)] = PipelineTileState((m, n, k))
+
+        self.layer_busy     = [[] for _ in range(6)]
+        self.parallel_limit = {3: 24, 4: 24, 5: 24}
+
+    def simulate(self):
+        while not self._all_done():
+            self._advance_cycle()
+        return self.cycle
+
+    def _advance_cycle(self):
+        self._progress_running_stages()
+        self._try_launch_new_stages()
+        self.cycle += 1
+
+    def _progress_running_stages(self):
+        for stage_id in range(6):
+            done = []
+            for coord in self.layer_busy[stage_id]:
+                if self.states[coord].step():
+                    done.append(coord)
+            for coord in done:
+                self.layer_busy[stage_id].remove(coord)
+
+    def _try_launch_new_stages(self):
+        for coord, state in self.states.items():
+            stage = state.current_stage
+
+            # 本层资源检查
+            if stage in (0, 1, 2):
+                if self.layer_busy[stage]:
+                    continue
+            else:
+                if len(self.layer_busy[stage]) >= self.parallel_limit[stage]:
+                    continue
+
+            if not self._stage_ready(coord, stage):
+                continue
+
+            latency = self._get_stage_latency(coord, stage)
+            if latency is None:
+                continue
+
+            state.start_stage(stage, latency)
+            self.layer_busy[stage].append(coord)
+            # 更新本层上一次调度的 tile，用于下一次重用判断
+            self.prev_coord[stage] = coord
+
+    def _stage_ready(self, coord, stage_id):
+        m, n, k = coord
+        state = self.states[coord]
+
+        if stage_id == 0:   # OUT2
+            return True
+        elif stage_id == 1: # OUT1
+            return state.is_stage_completed(0)
+        elif stage_id == 2: # FIX
+            return state.is_stage_completed(5) and not self.layer_busy[1]
+        elif stage_id == 3: # MTE2
+            return state.is_stage_completed(0)
+        elif stage_id == 4: # MTE1
+            if not state.is_stage_completed(3):
+                return False
+            if k > 0:
+                prev = self.states[(m, n, k - 1)]
+                if not prev.is_stage_completed(2):
+                    return False
+            return True
+        elif stage_id == 5: # M
+            return state.is_stage_completed(4)
+        return False
+
+    def _get_stage_latency(self, coord, stage_id):
+        m, n, k = coord
+        chip_tile = self.chip_tiles[m, n, k]
+        A = chip_tile.M * chip_tile.K * chip_tile.elem_bytes
+        B = chip_tile.K * chip_tile.N * chip_tile.elem_bytes
+        C = chip_tile.M * chip_tile.N * chip_tile.elem_bytes
+
+        # 重用判断：根据上次调度的 tile 坐标
+        prev = self.prev_coord[stage_id]
+        if prev is None:
+            load_A = load_B = 1
+        else:
+            pm, pn, pk = prev
+            load_A = 1 if (n != pn or k != pk) else 0
+            load_B = 1 if (m != pm or k != pk) else 0
+
+        if stage_id == 0: # OUT2
+            base = load_A * _device.io.load(A, 'EXT', 'DRAM') + load_B * _device.io.load(B, 'EXT', 'DRAM')
+        elif stage_id == 1: # OUT1
+            base = _device.io.store(C, 'L2', 'DRAM')
+        elif stage_id == 2: # FIX
+            base = _device.io.store(C, 'L0C', 'L2')
+        elif stage_id == 3: # MTE2
+            base = load_A * (_device.io.load(A, 'DRAM', 'L2') + _device.io.load(A, 'L2', 'L1')) + load_B * (_device.io.load(B, 'DRAM', 'L2') + _device.io.load(B, 'L2', 'L1'))
+        elif stage_id == 4: # MTE1
+            t1 = max(load_A * _device.io.load(A, 'L1', 'L0A'), load_B * _device.io.load(B, 'L1', 'L0B'))
+            if k > 0:
+                prev_fix = self.states[(m, n, k - 1)]
+                if not prev_fix.is_stage_completed(2):
+                    return None
+            t2 = _device.io.store(C, 'AccumDFF', 'L0C')
+            base = t1 + t2
+        elif stage_id == 5: # M
+            base = _device.compute.compute(chip_tile.M, chip_tile.N, chip_tile.K)
+        else:
+            return None
+
+        return base + self.flag_delay
+
+    def _all_done(self):
+        return all(5 in s.completed_stages for s in self.states.values())
+
+
                         
 class Chip_tile:
     """
