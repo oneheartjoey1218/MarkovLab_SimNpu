@@ -1,6 +1,3 @@
-from dataclasses import dataclass
-
-@dataclass(frozen=True)
 class HardwareSpec:
     def __init__(self):
         # Cube 计算单元：16×16×16 FP16 矩阵乘，每周期 4096 MAC
