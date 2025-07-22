@@ -43,6 +43,9 @@ class HardwareSpec:
         self.L2_DRAM_BW  = 1024   # L2 Cache - 芯片 DRAM
         #DRAM→L2 UB→DRAM DRAM→L1（第一次可能不会触发缓存）
         self.IO_BW = { # 【这里应该加一个DRAM→L1 的带宽】【网上号称昇腾的主存是HBM，带宽达到1.2TB/s，但是哪一段的带宽不得而知】
+            'L0C→L2':  self.MIN_ACCESS['L0C'], # 先占位
+            'L2→L0C':  self.MIN_ACCESS['L0C'], # 占位
+            'DRAM→L1': self.DRAM_L2_BW, # 占位
             'EXT→DRAM': self.EXT_DRAM_BW,
             'DRAM→EXT': self.DRAM_EXT_BW,
             'DRAM→L2': self.DRAM_L2_BW,

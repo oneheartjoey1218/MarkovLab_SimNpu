@@ -8,11 +8,7 @@ from modules import (
 
 from hardware import HardwareSpec, HW # 全局硬件实例
 
-_device = Device(
-    compute=ComputeModule(),
-    io=IOModule(),
-    memory=MemoryModule()
-)
+from modules import device as _device, L2_CACHE_MGR
 
 from math import ceil
 import numpy as np
@@ -389,6 +385,15 @@ class PipelineScheduler:
         ai = sim.strategy.chip_type.AI_CORE_COUNT
         self.parallel_limit = {3: ai, 4: ai, 5: ai}
     
+    NEXT_STAGE = {          # 正确的流水顺序
+        0: 3,   # OUT2  → MTE2
+        3: 4,   # MTE2  → MTE1
+        4: 5,   # MTE1  → M
+        5: 2,   # M     → FIX
+        2: 1,   # FIX   → OUT1
+        1: 6    # OUT1  → 结束 (6 表示全部完成)
+    }
+    
     def _build_core_map(self):
         """
         将 M×N tile 网格划成 row_grp 行，每行用 4 个 core，
@@ -422,11 +427,14 @@ class PipelineScheduler:
     def _progress_running_stages(self):
         for stage_id in range(6):
             done = []
-            for coord in self.layer_busy[stage_id]:
-                if self.states[coord].step():
-                    done.append(coord)
+            for coord in list(self.layer_busy[stage_id]):
+                state = self.states[coord]
+                if state.step():          # step() 在剩余周期→0 时返回 True
+                    done.append(coord)    # 收集已完成的 tile
             for coord in done:
                 self.layer_busy[stage_id].remove(coord)
+                state = self.states[coord]
+                state.current_stage = self.NEXT_STAGE[stage_id]
 
     def _try_launch_new_stages(self):
         for coord, state in self.states.items():
@@ -446,7 +454,13 @@ class PipelineScheduler:
             latency = self._get_stage_latency(coord, stage)
             if latency is None:
                 continue
-
+            if latency == 0:
+                state.completed_stages.add(stage)
+                state.current_stage = self.NEXT_STAGE[stage]
+                self.prev_coord[stage] = coord
+                # 直接进入下一轮调度，不占用 layer_busy
+                continue
+            
             state.start_stage(stage, latency)
             self.layer_busy[stage].append(coord)
             # 更新本层上一次调度的 tile，用于下一次重用判断
@@ -459,7 +473,7 @@ class PipelineScheduler:
         if stage_id == 0:   # OUT2
             return True
         elif stage_id == 1: # OUT1
-            return state.is_stage_completed(0)
+            return state.is_stage_completed(2)
         elif stage_id == 2: # FIX
             return state.is_stage_completed(5) and not self.layer_busy[1]
         elif stage_id == 3: # MTE2
