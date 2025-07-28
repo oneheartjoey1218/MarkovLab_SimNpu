@@ -1,15 +1,7 @@
-from modules import (
-    Device,
-    ComputeModule,
-    IOModule,
-    MemoryModule,
-    L2_CACHE_MGR
-)
-
 from hardware import HardwareSpec, HW # 全局硬件实例
 
 from modules import device as _device, L2_CACHE_MGR
-
+from typing import List, Dict
 from math import ceil
 import numpy as np
 import copy
@@ -179,65 +171,52 @@ class Simulate:
 
     def build_tiles(self):
         """
-        根据原始矩阵大小 self.M,self.N,self.K 以及分块尺寸 self.M_tile,self.N_tile,self.K_tile，
-        构建一个三维的 tile 数组 self.tiles，数组元素都是 Chip_tile 实例。
+        构建 self.tiles（三维 Chip_tile 数组），并对每个 tile 调用 build_subtiles()。
         """
-        # 1) 计算每个维度的完整块数和剩余大小
-        M_l2_t   = self.M // self.M_tile
-        N_l2_t   = self.N // self.N_tile
-        K_l2_t   = self.K // self.K_tile
-        M_remain = self.M % self.M_tile
-        N_remain = self.N % self.N_tile
-        K_remain = self.K % self.K_tile
+        from math import ceil
+        import numpy as np
 
-        # 2) 创建空的 tiles 数组
-        # ceil(self.M/self.M_tile) 表示 M 方向的块数，以此类推
-        self.tiles = np.empty([
+        # 1) 计算完整块数与边界余数
+        M_l2 = self.M // self.M_tile
+        N_l2 = self.N // self.N_tile
+        K_l2 = self.K // self.K_tile
+        M_rem = self.M % self.M_tile
+        N_rem = self.N % self.N_tile
+        K_rem = self.K % self.K_tile
+
+        # 2) 分配空数组
+        dims = [
             ceil(self.M / self.M_tile),
             ceil(self.N / self.N_tile),
             ceil(self.K / self.K_tile),
-        ], dtype=Chip_tile)
+        ]
+        self.tiles = np.empty(dims, dtype=object)
 
-        # 3) 批量初始化“完整分块”
-        if M_l2_t and N_l2_t and K_l2_t:
-            self.tiles[:M_l2_t, :N_l2_t, :K_l2_t] = \
-                self.create_chip_tile(self.M_tile, self.N_tile, self.K_tile)
+        # 3) 批量初始化完整分块
+        block = self.create_chip_tile(self.M_tile, self.N_tile, self.K_tile)
+        if M_l2 and N_l2 and K_l2:
+            self.tiles[:M_l2, :N_l2, :K_l2] = block
 
-        # 4) 处理 M 方向的边界分块
-        if M_remain:
-            self.tiles[-1, :N_l2_t, :K_l2_t] = \
-                self.create_chip_tile(M_remain, self.N_tile, self.K_tile)
+        # 4) 各方向边界
+        if M_rem:
+            self.tiles[-1, :N_l2, :K_l2] = self.create_chip_tile(M_rem, self.N_tile, self.K_tile)
+        if N_rem:
+            self.tiles[:M_l2, -1, :K_l2] = self.create_chip_tile(self.M_tile, N_rem, self.K_tile)
+        if K_rem:
+            self.tiles[:M_l2, :N_l2, -1] = self.create_chip_tile(self.M_tile, self.N_tile, K_rem)
+        if M_rem and N_rem:
+            self.tiles[-1, -1, :K_l2] = self.create_chip_tile(M_rem, N_rem, self.K_tile)
+        if M_rem and K_rem:
+            self.tiles[-1, :N_l2, -1] = self.create_chip_tile(M_rem, self.N_tile, K_rem)
+        if N_rem and K_rem:
+            self.tiles[:M_l2, -1, -1] = self.create_chip_tile(self.M_tile, N_rem, K_rem)
+        if M_rem and N_rem and K_rem:
+            self.tiles[-1, -1, -1] = self.create_chip_tile(M_rem, N_rem, K_rem)
 
-        # 5) 处理 N 方向的边界分块
-        if N_remain:
-            self.tiles[:M_l2_t, -1, :K_l2_t] = \
-                self.create_chip_tile(self.M_tile, N_remain, self.K_tile)
-
-        # 6) 处理 K 方向的边界分块
-        if K_remain:
-            self.tiles[:M_l2_t, :N_l2_t, -1] = \
-                self.create_chip_tile(self.M_tile, self.N_tile, K_remain)
-
-        # 7) 处理 M+N 的双向边界
-        if M_remain and N_remain:
-            self.tiles[-1, -1, :K_l2_t] = \
-                self.create_chip_tile(M_remain, N_remain, self.K_tile)
-
-        # 8) 处理 M+K 的双向边界
-        if M_remain and K_remain:
-            self.tiles[-1, :N_l2_t, -1] = \
-                self.create_chip_tile(M_remain, self.N_tile, K_remain)
-
-        # 9) 处理 N+K 的双向边界
-        if N_remain and K_remain:
-            self.tiles[:M_l2_t, -1, -1] = \
-                self.create_chip_tile(self.M_tile, N_remain, K_remain)
-
-        # 10) 处理 M+N+K 三向边界
-        if M_remain and N_remain and K_remain:
-            self.tiles[-1, -1, -1] = \
-                self.create_chip_tile(M_remain, N_remain, K_remain)
-                    # 验证缓存容量是否足够
+        # 5) 为每个 Chip_tile 生成 L1/L0 子块
+        for chip in self.tiles.flatten():
+            if chip is not None:
+                chip.build_subtiles()
                     
     def load_look_up_table(self):
         # 这里需要根据实际情况加载查找表
@@ -306,23 +285,98 @@ class Simulate:
                     for k in range(K_tiles):
                         yield m, n, k
                         
-    def calculate_pipelined_cycles(self) -> int:
-        # 0) 容量校验：确保每块 tile 在 L2 缓存中有足够空间
-        self.load_look_up_table()
-        self.validate_cache_capacity()
-
-        # 1) LUT 加载：若后续要用查找表修正阶段延迟，就先加载
+    def calculate_pipelined_cycles(self) -> float:
+        """
+        离散事件仿真 + 并行加载优化：
+        批量 L1/L0 加载阶段改为并行（取最大时延）
+        """
+        # 1) 查表与缓存校验
         if not hasattr(self, 'look_up_table') or self.look_up_table is None:
             self.load_look_up_table()
+        self.validate_cache_capacity()
 
-        # 2) 分块
+        # 2) 多级分块
         self.build_tiles()
 
-        # 3) 启动流水线调度，返回总周期
-        scheduler = PipelineScheduler(self)
-        return scheduler.simulate()
+        # 3) 初始化 DES 调度器
+        from des_simulator import PipelineSimulator, Pipeline, OpType, TileLevel
+        core_cnt = self.strategy.chip_type.AI_CORE_COUNT
+        parallel_limit = {
+            Pipeline.OUT2: 1,
+            Pipeline.OUT1: 1,
+            Pipeline.FIX:  core_cnt,
+            Pipeline.MTE2: core_cnt,
+            Pipeline.MTE1: core_cnt,
+            Pipeline.M:    core_cnt,
+        }
+        sim = PipelineSimulator(parallel_limit)
 
+        # 回调：批量 L0 加载后调度计算
+        def cb_compute_batch(evt_batch):
+            for l0 in evt_batch.metadata:
+                sim.add_event(
+                    OpType.CUBE_GEMM, TileLevel.CUBE, Pipeline.M,
+                    l0.compute_latency,
+                    [evt_batch], on_complete=cb_write, metadata=l0
+                )
 
+        # 回调：L1-L0 并行加载
+        def cb_l0(evt_l1):
+            l0_list = evt_l1.metadata.l0_tiles
+            # 并行加载：对每个 L0_tile 分别取 A/B 最大延迟，再对所有 L0_tile 取最大
+            batch_dur = max((max(l0.load_A_latency, l0.load_B_latency) for l0 in l0_list))
+            sim.add_event(
+                OpType.L1_TO_L0AB, TileLevel.L0, Pipeline.MTE1,
+                batch_dur, [evt_l1], on_complete=cb_compute_batch, metadata=l0_list
+            )
+
+        # 回调：写回链
+        def cb_write(evt_m):
+            l0 = evt_m.metadata
+            e1 = sim.add_event(
+                OpType.ACCUM_TO_L0C, TileLevel.L0, Pipeline.MTE1,
+                l0.write_latency, [evt_m], metadata=l0
+            )
+            e2 = sim.add_event(
+                OpType.L0C_TO_L2, TileLevel.L1, Pipeline.FIX,
+                l0.write_latency, [e1], metadata=l0
+            )
+            e3 = sim.add_event(
+                OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
+                l0.write_latency, [e2], metadata=l0
+            )
+            sim.add_event(
+                OpType.MEM_TO_EXT, TileLevel.CHIP, Pipeline.OUT2,
+                l0.write_latency, [e3], metadata=l0
+            )
+
+        # 回调
+        def cb_l1(evt_chip):
+            for l1 in evt_chip.metadata.l1_tiles:
+                # 并行加载 A/B 到 L1
+                load_dur = max(l1.load_A_latency, l1.load_B_latency)
+                sim.add_event(
+                    OpType.MEM_TO_L2_L1, TileLevel.L1, Pipeline.MTE2,
+                    load_dur, [evt_chip], on_complete=cb_l0, metadata=l1
+                )
+
+        # 4) 首批 Chip 级事件
+        dim0, dim1, dim2 = self.tiles.shape
+        for m in range(dim0):
+            for n in range(dim1):
+                for k in range(dim2):
+                    chip = self.tiles[m, n, k]
+                    if not chip:
+                        continue
+                    # 并行加载 A/B 至 chip
+                    lat = max(chip.out2_A, chip.out2_B)
+                    sim.add_event(
+                        OpType.EXT_TO_MEM, TileLevel.CHIP, Pipeline.OUT2,
+                        lat, [], on_complete=cb_l1, metadata=chip
+                    )
+
+        # 5) 运行并返回总周期
+        return sim.run()
 
 
 class PipelineTileState:
@@ -620,33 +674,101 @@ class Chip_tile:
         '''
         新流水线逻辑至此
         '''
+        self.l1_tiles: List[L1_tile] = []
+        self.l0_tiles: Dict[int, List[L0_tile]] = {}
+        
+    def build_subtiles(self):
+        """
+        在每个 Chip_tile 上，按照 L1 缓存容量切分出 l1_tiles，
+        并为每个 L1_tile 调用 build_subtiles() 生成对应的 L0_tile。
+        """
+        from matmul import split_blocks, L1_tile
+
+        # L1 切分
+        max_L1 = self.strategy.chip_type.L1_CAPACITY // self.elem_bytes
+        self.l1_tiles = []
+        for idx, (m1, n1, k1) in enumerate(
+            split_blocks([(self.M_tile, self.N_tile, self.K_tile)], max_L1)
+        ):
+            l1 = L1_tile(id=idx, strategy=self.strategy, M=m1, N=n1, K=k1)
+            # 生成 L0 级子块
+            l1.build_subtiles()
+            self.l1_tiles.append(l1)
+            
+        
         
 class L1_tile:
-    """
-    从 L1 分块到 L0 上。注意一个L1对应两个L0，因此在写约束的时候注意要把约束除以2；L2 cache机制也要考虑，不过不要和Chip层重复计算
-    """
-    def __init__(self, id, strategy=None, M=None, N=None, K=None):
-        self.L1_id = id
-        self.M_tile = M
-        self.N_tile = N
-        self.K_tile = K
-    def calculate_cycles(self):
-         # 不会被 PipelineScheduler调用，留作兼容
-        return 0
+    def __init__(self, id: int, strategy: 'MatMul_Strategy', M: int, N: int, K: int):
+        self.id = id
+        self.strategy   = strategy
+        self.M_tile     = M
+        self.N_tile     = N
+        self.K_tile     = K
+        self.elem_bytes = strategy.elem_bytes
+        # DRAM->L2 + L2->L1 延迟计算
+        
+        # 计算A和B从DRAM到L2，再从L2到L1的传输延迟
+        io_bw = strategy.chip_type.IO_BW # I/O带宽字典
+        A_bytes = M * K * self.elem_bytes # A矩阵在该tile中的字节数
+        B_bytes = K * N * self.elem_bytes # B矩阵在该tile中的字节数
+        
+        # 加载A和B所需时间
+        self.load_A_latency = A_bytes / io_bw['DRAM→L2'] + A_bytes / io_bw['L2→L1']
+        self.load_B_latency = B_bytes / io_bw['DRAM→L2'] + B_bytes / io_bw['L2→L1']
+        
+        # 初始化空的L0子块列表（后续通过切分填充）
+        self.l0_tiles: List['L0_tile'] = []
+
+    def build_subtiles(self):
+        """
+        为当前 L1_tile 切分 L0_tile 并填充 self.l0_tiles
+        """
+        from matmul import split_blocks, L0_tile # 导入L0_tile类与切分函数
+        
+        # 根据L0A和L0B容量，计算每个L0子tile可容纳的最大元素数
+        max_L0A = self.strategy.chip_type.L0A_CAPACITY // self.elem_bytes
+        max_L0B = self.strategy.chip_type.L0B_CAPACITY // self.elem_bytes
+        max_L0  = min(max_L0A, max_L0B)
+        
+        self.l0_tiles = [] # 初始化 L0 子 tile 列表
+        
+        # 使用split_blocks对当前L1 tile的M×N×K进行切分，得到多个L0子块
+        for idx, (m0, n0, k0) in enumerate(
+            split_blocks([(self.M_tile, self.N_tile, self.K_tile)], max_L0)
+        ):
+            # 构建 L0_tile 并加入列表
+            self.l0_tiles.append(
+                L0_tile(id=idx, strategy=self.strategy, M=m0, N=n0, K=k0)
+            )
     
 class L0_tile:
+    """"
+    大部分和L1差不多
     """
-    L0 级别 Tile 的占位实现，流水线模式下不再做任何串行计算。
-    """
-    def __init__(self, id, strategy=None, M=None, N=None, K=None):
-        self.L0_id    = id
-        self.M_tile   = M
-        self.N_tile   = N
-        self.K_tile   = K
-
-    def calculate_cycles(self):
-        # 不会被 PipelineScheduler调用
-        return 0
+    def __init__(self, id: int, strategy: 'MatMul_Strategy', M: int, N: int, K: int):
+        self.id = id
+        self.strategy   = strategy
+        self.M_tile     = M
+        self.N_tile     = N
+        self.K_tile     = K
+        self.elem_bytes = strategy.elem_bytes
+        
+        io_bw   = strategy.chip_type.IO_BW
+        macs_pc = strategy.chip_type.CUBE_MACS_PER_CYCLE
+        
+        A_bytes = M * K * self.elem_bytes
+        B_bytes = K * N * self.elem_bytes
+        C_bytes = M * N * self.elem_bytes
+        
+        # A和B从L1到LA的传输延迟
+        self.load_A_latency    = A_bytes / io_bw['L1→L0A']
+        self.load_B_latency    = B_bytes / io_bw['L1→L0B']
+        
+        # GEMM计算延迟 = 总MAC次数 / 每周期可完成的MAC数
+        self.compute_latency   = (M * N * K) / macs_pc
+        
+        # 写入L0C的延迟
+        self.write_latency     = C_bytes / io_bw['AccumDFF→L0C'] 
 
 
 class UB_tile:
