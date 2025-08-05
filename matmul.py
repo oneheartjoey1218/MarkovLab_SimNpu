@@ -1,10 +1,11 @@
 from hardware import HardwareSpec, HW # 全局硬件实例
-
 from modules import device as _device, L2_CACHE_MGR
 from typing import List, Dict
 from math import ceil
 import numpy as np
 import copy
+from des_simulator import OpType, TileLevel, Pipeline, PipelineSimulator
+
 
 # 划分矩阵乘法的策略
 def split_blocks(blocks, max_elems):
@@ -128,6 +129,8 @@ class MatMul_Strategy:
         return 0
     
 
+
+
 class Simulate:
     """
     从原始矩阵分块到芯片上
@@ -168,6 +171,7 @@ class Simulate:
         self.compute_latency = None     # 内层计算耗时
         self.mem_alloc_read_latency = None   # 内存分配耗时
         self.mem_alloc_write_latency = None  # 内存分配耗时
+        from des_simulator import Pipeline
 
     def build_tiles(self):
         """

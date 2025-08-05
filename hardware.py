@@ -2,7 +2,7 @@ class HardwareSpec:
     def __init__(self):
         # Cube 计算单元：16×16×16 FP16 矩阵乘，每周期 4096 MAC
         self.CUBE_MACS_PER_CYCLE = 4096
-
+        self.CLOCK_FREQ = 1.8e9 # 主频
         # AI Core个数
         self.AI_CORE_COUNT = 24
 
@@ -43,23 +43,23 @@ class HardwareSpec:
         self.L2_DRAM_BW  = 1024   # L2 Cache - 芯片 DRAM
         #DRAM→L2 UB→DRAM DRAM→L1（第一次可能不会触发缓存）
         self.IO_BW = { # 【这里应该加一个DRAM→L1 的带宽】【网上号称昇腾的主存是HBM，带宽达到1.2TB/s，但是哪一段的带宽不得而知】
-            'L0C→L2':  self.MIN_ACCESS['L0C'], # 先占位
-            'L2→L0C':  self.MIN_ACCESS['L0C'], # 占位
-            'DRAM→L1': self.DRAM_L2_BW, # 占位
-            'EXT→DRAM': self.EXT_DRAM_BW,
-            'DRAM→EXT': self.DRAM_EXT_BW,
-            'DRAM→L2': self.DRAM_L2_BW,
-            'L2→DRAM': self.L2_DRAM_BW,
-            'L2→L1': self.MIN_ACCESS['L1'],
-            'L1→L0A': self.MIN_ACCESS['L0A'],
-            'L1→L0B': self.MIN_ACCESS['L0B'],
+            'L0C→L2':  86, # L2写速率
+            'L2→L0C':  110, # L2读速率
+            'DRAM→L1': 32, # DDR读速率
+            'EXT→DRAM': 32, # DDR写速率
+            'DRAM→EXT': 32, # DDR读速率
+            'DRAM→L2': 32, # DDR读速率
+            'L2→DRAM': 32, # DDR写速率
+            'L2→L1': 110, # L2总线速率
+            'L1→L0A': 55,
+            'L1→L0B': 55,
             'L0A→L1': self.MIN_ACCESS['L0A'],
             'L0B→L1': self.MIN_ACCESS['L0B'],
             'L1→L0C': self.MIN_ACCESS['L0C'],
-            'L0C→L1': self.MIN_ACCESS['L0C'],
+            'L0C→L1': 20,
             'L0C→UB': self.MIN_ACCESS['L0C'],
             'UB→L0C': self.MIN_ACCESS['L0C'],
-            'AccumDFF→L0C': self.MIN_ACCESS['AccumDFF'],
+            'AccumDFF→L0C': 210,
             'UB→L1': self.MIN_ACCESS['L1']
         }
         

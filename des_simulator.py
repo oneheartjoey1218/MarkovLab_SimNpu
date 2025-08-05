@@ -45,6 +45,7 @@ class PipelineEvent:
     def __post_init__(self):
         self.start_cycle: float = 0.0 # 开始周期
         self.end_cycle: float = 0.0 # 结束周期，就是开始+duration
+        self.sim = None
 
 # 离散事件仿真器类
 class PipelineSimulator:
