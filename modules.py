@@ -7,8 +7,14 @@ def align(size: int, granularity: int) -> int:
 
 class ComputeModule:
     def compute(self, M: int, N: int, K: int) -> float:
-        """执行 M×K × K×N 矩阵乘，返回周期数"""
-        return (M * N * K) / HW.CUBE_MACS_PER_CYCLE
+        if getattr(HW, "ALIGN_COMPUTE_16", False):
+            def ceil16(x: int) -> int:
+                return (x + 15) // 16 * 16
+            Mm = ceil16(M); Nn = ceil16(N); Kk = ceil16(K)
+        else:
+            Mm, Nn, Kk = M, N, K
+        # 用每核MAC速率计算；并行度由 AI_CORE_COUNT 限制控制
+        return (Mm * Nn * Kk) / HW.CUBE_MACS_PER_CORE
 
 class IOModule:
     def load(self, size: int, src: str, dst: str) -> float:
@@ -82,17 +88,33 @@ class InputOutputL2Cache:
         self.pending_writes: list[int] = []
 
     def read(self, address: int, size: int) -> float:
-        total = 0.0
+        # number of cache lines
         lines = (size + self.block_size - 1) // self.block_size
+
+        # Per-line costs
+        l2_to_l1 = device.io.load(self.block_size, 'L2', 'L1')
+        dram_to_l2 = device.io.load(self.block_size, 'DRAM', 'L2')
+
+        use_db = getattr(HW, 'MTE2_DOUBLE_BUFFER', True)
+        miss_cost = max(dram_to_l2, l2_to_l1) if use_db else (dram_to_l2 + l2_to_l1)
+
+        # If a fixed hit rate is provided, bypass set-associative simulation for speed/stability
+        if hasattr(HW, 'L2_FIXED_HIT_RATE') and HW.L2_FIXED_HIT_RATE is not None:
+            hit_rate = float(HW.L2_FIXED_HIT_RATE)
+            if hit_rate < 0.0: hit_rate = 0.0
+            if hit_rate > 1.0: hit_rate = 1.0
+            hit_lines = int(lines * hit_rate)
+            miss_lines = lines - hit_lines
+            return hit_lines * l2_to_l1 + miss_lines * miss_cost
+
+        # Otherwise, fall back to set-associative access modeling
+        total = 0.0
         for i in range(lines):
             addr = address + i * self.block_size
             if self.input_cache.access(addr):
-                # L2 命中路径：L2→L1
-                total += device.io.load(self.block_size, 'L2', 'L1')
+                total += l2_to_l1
             else:
-                # L2 未命中：DRAM→L2 + L2→L1
-                total += device.io.load(self.block_size, 'DRAM', 'L2')
-                total += device.io.load(self.block_size, 'L2',   'L1')
+                total += miss_cost
         return total
     
     def write(self, size: int) -> float:

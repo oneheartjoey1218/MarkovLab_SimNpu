@@ -1,8 +1,9 @@
 from enum import Enum
 from dataclasses import dataclass
 import heapq
-from typing import List, Dict, Callable, Any
+from typing import List, Dict, Callable, Any, Tuple
 
+LAST_SIM = None
 # 定义各个流水线阶段的类
 class Pipeline(Enum):
     OUT2 = "OUT2"   # 外部 → MEM
@@ -17,6 +18,7 @@ class OpType(Enum):
     EXT_TO_MEM    = "外部→MEM"
     MEM_TO_L2_L1  = "MEM→L2→L1"
     L1_TO_L0AB    = "L1→L0A/L0B"
+    L0C_TO_ACCUM  = "L0C→Accum_DFF"
     L0AB_TO_DFF   = "L0A/B→A/B_DFF"
     CUBE_GEMM     = "Cube GEMM"
     ACCUM_TO_L0C  = "Accum_DFF→L0C"
@@ -49,13 +51,34 @@ class PipelineEvent:
 
 # 离散事件仿真器类
 class PipelineSimulator:
-    def __init__(self, parallel_limit: Dict[Pipeline, int]):
-        self.current_cycle: float = 0.0 # 当前全局周期
-        self.event_queue: List[(float, int, PipelineEvent)] = [] # 最小堆队列
-        self.pipeline_busy: Dict[Pipeline, List[PipelineEvent]] = {p: [] for p in Pipeline} # 事件列表，流水线分开
-        self.parallel_limit: Dict[Pipeline, int] = parallel_limit # 各流水线并发限制
+    def __init__(self, parallel_limit: Dict[Pipeline, int], verbose: bool = False):
+        self.current_cycle: float = 0.0
+        self.event_queue: List[(float, int, PipelineEvent)] = []
+        self.pipeline_busy: Dict[Pipeline, List[PipelineEvent]] = {p: [] for p in Pipeline}
+        self.parallel_limit: Dict[Pipeline, int] = parallel_limit
         self._counter: int = 0
+        self.verbose = verbose
+        self.intervals = {p: [] for p in Pipeline}
 
+    # 计算给定流水线集合的并集时长（cycles）
+    def union_cycles_of(self, include):
+        iv = []
+        for p in include:
+            iv.extend(self.intervals.get(p, []))
+        if not iv:
+            return 0.0
+        iv.sort(key=lambda x: x[0])
+        merged = []
+        cur_s, cur_e = iv[0]
+        for s, e in iv[1:]:
+            if s <= cur_e:
+                cur_e = max(cur_e, e)
+            else:
+                merged.append((cur_s, cur_e))
+                cur_s, cur_e = s, e
+        merged.append((cur_s, cur_e))
+        return sum(e - s for s, e in merged)
+    
     # 添加一个事件并计算开始时间
     def add_event(
         self,
@@ -84,8 +107,13 @@ class PipelineSimulator:
         evt.end_cycle = start + duration
         
         busy.append(evt) # 加入busy列表
-        self._counter += 1
+        if not hasattr(self, 'all_events'):
+            self.all_events = []
+        self.all_events.append(evt)
         
+        self.intervals[pipeline].append((evt.start_cycle, evt.end_cycle))
+    
+        self._counter += 1
         # 放入事件队列并按结束时间排序
         heapq.heappush(self.event_queue, (evt.end_cycle, self._counter, evt))
         return evt
@@ -94,19 +122,46 @@ class PipelineSimulator:
     # 仿真启动器
     def run(self, max_cycles: float = float('inf')) -> float:
         while self.event_queue and self.current_cycle < max_cycles:
-            end_cycle, _, evt = heapq.heappop(self.event_queue) # 取出最早完成的事件
-            self.current_cycle = end_cycle # 推进当前周期
-            
-            # 如果是 chip_tile 且是最终写回阶段，打印完成信息，测试用
-            if evt.level == TileLevel.CHIP and evt.op == OpType.MEM_TO_EXT:
+            end_cycle, _, evt = heapq.heappop(self.event_queue)
+            self.current_cycle = end_cycle
+            if self.verbose and evt.level == TileLevel.CHIP and evt.op == OpType.MEM_TO_EXT:
                 meta_id = getattr(evt.metadata, 'id', None)
                 print(f"Chip_tile ID={meta_id} 完成 at 周期 {evt.end_cycle:.1f}")
-                
-            # 从busy列表删除
             self.pipeline_busy[evt.pipeline].remove(evt)
-            
-            # 触发后续事件
             if evt.on_complete:
                 evt.on_complete(evt)
-        print(f"*** Total cycles: {self.current_cycle:.1f} ***") # 总周期数
+        if self.verbose:
+            print(f"*** Total cycles: {self.current_cycle:.1f} ***")
         return self.current_cycle
+    
+
+
+    def run_with_breakdown(self, max_cycles: float = float('inf')):
+        """
+        运行仿真，返回总周期, 各流水线的忙碌周期
+        忙碌时间用事件时间区间的并集
+        """
+        total_cycles = self.run(max_cycles)
+
+        def union_length(intervals):
+            if not intervals:
+                return 0.0
+            iv = sorted(intervals, key=lambda x: x[0])
+            merged = []
+            cur_s, cur_e = iv[0]
+            for s, e in iv[1:]:
+                if s <= cur_e:
+                    cur_e = max(cur_e, e)
+                else:
+                    merged.append((cur_s, cur_e))
+                    cur_s, cur_e = s, e
+            merged.append((cur_s, cur_e))
+            return sum(e - s for s, e in merged)
+        totals = {p: union_length(self.intervals[p]) for p in Pipeline}
+        global LAST_SIM
+        LAST_SIM = self
+
+        return total_cycles, totals
+
+    
+

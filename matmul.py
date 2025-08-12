@@ -227,21 +227,33 @@ class Simulate:
         self.look_up_table = {}
         
     def validate_cache_capacity(self):
-        # 计算所需的缓存空间
-        required_cache = (
-            self.M_tile * self.N_tile + 
-            self.N_tile * self.K_tile + 
-            self.M_tile * self.K_tile
-        ) * self.elem_bytes
-        
-        # 获取可用的缓存容量 L2_CAPACITY!
+        """使用 L2 tile 的尺寸来校验 L2 容量，
+        因为一次搬运/驻留只需要容纳一个 L2 级 tile 的 A、B、C。
+        回退逻辑：如果策略里没有给出 L2 tile，就使用当前 chip 级 tile 的尺寸。
+        """
+        # 选择用于校验的 mnk
+        mnk = None
+        try:
+            if self.strategy is not None and getattr(self.strategy, 'L2_mnk_values', None):
+                t = self.strategy.L2_mnk_values[0]
+                if t is not None and all(x is not None for x in t):
+                    mnk = t
+        except Exception:
+            mnk = None
+        if mnk is None:
+            mnk = (self.M_tile, self.N_tile, self.K_tile)
+        Mv, Nv, Kv = mnk
+
+        # 所需缓存空间（字节）：A(M×K) + B(K×N) + C(M×N)
+        required_cache = (Mv * Kv + Kv * Nv + Mv * Nv) * self.elem_bytes
+
+        # 可用缓存（L2 容量）
         available_cache = HW.L2_CAPACITY
         assert required_cache <= available_cache, (
-                f"缓存容量不足: 所需空间 {required_cache} 字节，"
-                f"可用空间 {available_cache} 字节"
-            )
-            #传入参数待修改！！！！！！！！！！！！！！！！！！！！！
-    '创建一个新的Chip_tile分块！'
+            f"缓存容量不足: 所需空间 {required_cache} 字节，可用空间 {available_cache} 字节；"
+            f"L2 tile = ({Mv}, {Nv}, {Kv}), elem_bytes={self.elem_bytes}"
+        )
+
     
     def create_chip_tile(self, M, N, K):
         return Chip_tile(
@@ -292,7 +304,7 @@ class Simulate:
     def calculate_pipelined_cycles(self) -> float:
         """
         离散事件仿真 + 并行加载优化：
-        批量 L1/L0 加载阶段改为并行（取最大时延）
+        批量 L1/L0 加载阶段改为并行
         """
         # 1) 查表与缓存校验
         if not hasattr(self, 'look_up_table') or self.look_up_table is None:
@@ -334,27 +346,29 @@ class Simulate:
                 batch_dur, [evt_l1], on_complete=cb_compute_batch, metadata=l0_list
             )
 
-        # 回调：写回链
         def cb_write(evt_m):
+            # 使用逐段真实带宽：AccumDFF→L0C → L0C→L2 → L2→DRAM → DRAM→EXT
             l0 = evt_m.metadata
+            C_bytes = l0.M_tile * l0.N_tile * l0.elem_bytes
             e1 = sim.add_event(
                 OpType.ACCUM_TO_L0C, TileLevel.L0, Pipeline.MTE1,
-                l0.write_latency, [evt_m], metadata=l0
+                _device.io.store(C_bytes, 'AccumDFF', 'L0C'), [evt_m], metadata=l0
             )
             e2 = sim.add_event(
                 OpType.L0C_TO_L2, TileLevel.L1, Pipeline.FIX,
-                l0.write_latency, [e1], metadata=l0
+                _device.io.store(C_bytes, 'L0C', 'L2'), [e1], metadata=l0
             )
             e3 = sim.add_event(
                 OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
-                l0.write_latency, [e2], metadata=l0
+                _device.io.store(C_bytes, 'L2', 'DRAM'), [e2], metadata=l0
             )
             sim.add_event(
                 OpType.MEM_TO_EXT, TileLevel.CHIP, Pipeline.OUT2,
-                l0.write_latency, [e3], metadata=l0
+                _device.io.store(C_bytes, 'DRAM', 'EXT'), [e3], metadata=l0
             )
 
-        # 回调
+
+        # 回调：DRAM/L2/L1 加载
         def cb_l1(evt_chip):
             for l1 in evt_chip.metadata.l1_tiles:
                 # 并行加载 A/B 到 L1
@@ -364,11 +378,11 @@ class Simulate:
                     load_dur, [evt_chip], on_complete=cb_l0, metadata=l1
                 )
 
-        # 4) 首批 Chip 级事件
+        # 4) 首批 Chip 级事件 —— 遍历顺序改为 K→M→N（原先是 M→N→K）
         dim0, dim1, dim2 = self.tiles.shape
-        for m in range(dim0):
-            for n in range(dim1):
-                for k in range(dim2):
+        for k in range(dim2):
+            for m in range(dim0):
+                for n in range(dim1):
                     chip = self.tiles[m, n, k]
                     if not chip:
                         continue
@@ -381,6 +395,159 @@ class Simulate:
 
         # 5) 运行并返回总周期
         return sim.run()
+
+    
+    def calculate_pipelined_cycles_with_breakdown(self):
+            if not hasattr(self, 'look_up_table') or self.look_up_table is None:
+                self.load_look_up_table()
+            self.validate_cache_capacity()
+            self.build_tiles()
+
+            from des_simulator import PipelineSimulator, Pipeline, OpType, TileLevel
+            ai = self.strategy.chip_type.AI_CORE_COUNT
+            parallel_limit = {
+                Pipeline.OUT2: 1,
+                Pipeline.OUT1: 1,
+                Pipeline.FIX:  ai,
+                Pipeline.MTE2: ai,
+                Pipeline.MTE1: ai,
+                Pipeline.M:    ai,
+            }
+            sim = PipelineSimulator(parallel_limit)
+
+            # 形状信息
+            M_tiles, N_tiles, K_tiles = self.tiles.shape
+
+            # —— 核映射（行分组 RR）——
+            row_grp = max(1, min(ai, M_tiles))
+            while ai % row_grp != 0 and row_grp > 1:
+                row_grp //= 2
+            cores_per_row = ai // row_grp
+            core_map = {}
+            for m in range(M_tiles):
+                base = (m % row_grp) * cores_per_row
+                for n in range(N_tiles):
+                    core_map[(m, n)] = base + (n % cores_per_row)
+
+            def assign_core(m, n):
+                return core_map[(m, n)]
+            c_state_ready_in_l0c = {}
+            c_state_ready_in_accum = {}
+            
+            def cb_compute_batch(evt_batch):
+                # evt_batch.metadata = (indexed_l0_list, (m,n,k))
+                indexed_l0_list, coord = evt_batch.metadata
+                m, n, k = coord
+                for idx, l0 in indexed_l0_list:
+                    C_bytes = l0.M_tile * l0.N_tile * l0.elem_bytes
+                    parents = [evt_batch]
+                    key = (m, n, idx)
+
+                    # 对于 k >= 1：在开始计算前必须把先前部分和从 L0C 搬回 Accum
+                    if k > 0:
+                        prev_ready = c_state_ready_in_l0c.get(key)
+                        if prev_ready is not None:
+                            prep = sim.add_event(
+                                OpType.L0C_TO_ACCUM, TileLevel.L0, Pipeline.MTE1,
+                                _device.io.load(C_bytes, 'L0C', 'AccumDFF'),
+                                [prev_ready]
+                            )
+                            parents = [prep]
+
+                    sim.add_event(
+                        OpType.CUBE_GEMM, TileLevel.CUBE, Pipeline.M,
+                        l0.compute_latency,
+                        parents, on_complete=cb_write, metadata=(idx, l0, coord)
+                    )
+
+            def cb_l0(evt_l1):
+                # evt_l1.metadata = (l1, coord)
+                l1, coord = evt_l1.metadata
+                l0_list = list(enumerate(l1.l0_tiles))
+                batch_dur = max((max(l0.load_A_latency, l0.load_B_latency) for _, l0 in l0_list))
+                sim.add_event(
+                    OpType.L1_TO_L0AB, TileLevel.L0, Pipeline.MTE1,
+                    batch_dur, [evt_l1], on_complete=cb_compute_batch, metadata=(l0_list, coord)
+                )
+
+            def cb_write(evt_m):
+                # evt_m.metadata = (idx, l0, (m,n,k))
+                idx, l0, coord = evt_m.metadata
+                m, n, k = coord
+                C_bytes = l0.M_tile * l0.N_tile * l0.elem_bytes
+                key = (m, n, idx)
+
+                # 本次 k 计算完成后：把最新的部分和从 Accum 回写到 L0C（持久化）
+                e_acc_to_l0c = sim.add_event(
+                    OpType.ACCUM_TO_L0C, TileLevel.L0, Pipeline.MTE1,
+                    _device.io.store(C_bytes, 'AccumDFF', 'L0C'), [evt_m], metadata=l0
+                )
+                c_state_ready_in_l0c[key] = e_acc_to_l0c
+
+                # 若已是该 (m,n) 的最后一个 K-slice，则一次性写出
+                if k == K_tiles - 1:
+                    e_l0c_l2 = sim.add_event(
+                        OpType.L0C_TO_L2, TileLevel.L1, Pipeline.FIX,
+                        _device.io.store(C_bytes, 'L0C', 'L2'), [e_acc_to_l0c], metadata=l0
+                    )
+                    if not getattr(HW, 'DEFER_OUT1_TO_END', False):
+                        e_out1 = sim.add_event(
+                            OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
+                            _device.io.store(C_bytes, 'L2', 'DRAM'), [e_l0c_l2], metadata=l0
+                        )
+                        sim.add_event(
+                            OpType.MEM_TO_EXT, TileLevel.CHIP, Pipeline.OUT2,
+                            _device.io.store(C_bytes, 'DRAM', 'EXT'), [e_out1], metadata=l0
+                        )
+
+            def cb_l1(evt_chip):
+                # evt_chip.metadata = (chip_tile, (m,n,k))
+                chip, coord = evt_chip.metadata
+                m, n, k = coord
+                core_id = assign_core(m, n)
+                # 基于 L2_CACHE_MGR 的真实加载时间（含命中/未命中）
+                for l1 in chip.l1_tiles:
+                    stride = HW.MIN_ACCESS['L2']
+                    a_addr = ((m * N_tiles + n) * K_tiles + k) * stride
+                    b_addr = ((n * M_tiles + m) * K_tiles + k) * stride
+                    a_lat = L2_CACHE_MGR.read(core_id, a_addr, l1.M_tile * l1.K_tile * l1.elem_bytes)
+                    b_lat = L2_CACHE_MGR.read(core_id, b_addr, l1.K_tile * l1.N_tile * l1.elem_bytes)
+                    load_lat = max(a_lat, b_lat)
+                    sim.add_event(
+                        OpType.MEM_TO_L2_L1, TileLevel.L1, Pipeline.MTE2,
+                        load_lat, [evt_chip], on_complete=cb_l0, metadata=(l1, coord)
+                    )
+
+            # 4) 首批 Chip 级事件：按 K→M→N 遍历，让相同 (m,n) 的多 K-slice 在时间轴上串起来
+            dim0, dim1, dim2 = self.tiles.shape
+            for k in range(dim2):
+                for m in range(dim0):
+                    for n in range(dim1):
+                        chip = self.tiles[m, n, k]
+                        if not chip:
+                            continue
+                        # 外部→芯片（OUT2）：把 A/B 送到芯片，完成后再进入 L2/L1
+                        lat = max(chip.out2_A, chip.out2_B)
+                        sim.add_event(
+                            OpType.EXT_TO_MEM, TileLevel.CHIP, Pipeline.OUT2,
+                            lat, [], on_complete=cb_l1, metadata=(chip, (m, n, k))
+                        )
+
+            # If deferring OUT1/OUT2, flush per-core cached C once all tiles have been computed
+            if getattr(HW, 'DEFER_OUT1_TO_END', False):
+                for core_id in range(self.strategy.chip_type.AI_CORE_COUNT):
+                    lat = L2_CACHE_MGR.flush(core_id)
+                    if lat > 0:
+                        sim.add_event(
+                            OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
+                            lat, [], metadata={'core': core_id}
+                        )
+            return sim.run_with_breakdown()
+
+
+
+
+
 
 
 class PipelineTileState:
@@ -746,9 +913,6 @@ class L1_tile:
             )
     
 class L0_tile:
-    """"
-    大部分和L1差不多
-    """
     def __init__(self, id: int, strategy: 'MatMul_Strategy', M: int, N: int, K: int):
         self.id = id
         self.strategy   = strategy
@@ -756,23 +920,18 @@ class L0_tile:
         self.N_tile     = N
         self.K_tile     = K
         self.elem_bytes = strategy.elem_bytes
-        
+
         io_bw   = strategy.chip_type.IO_BW
-        macs_pc = strategy.chip_type.CUBE_MACS_PER_CYCLE
-        
+        macs_pc = strategy.chip_type.CUBE_MACS_PER_CORE  # ← 用每核速率
+
         A_bytes = M * K * self.elem_bytes
         B_bytes = K * N * self.elem_bytes
         C_bytes = M * N * self.elem_bytes
-        
-        # A和B从L1到LA的传输延迟
-        self.load_A_latency    = A_bytes / io_bw['L1→L0A']
-        self.load_B_latency    = B_bytes / io_bw['L1→L0B']
-        
-        # GEMM计算延迟 = 总MAC次数 / 每周期可完成的MAC数
-        self.compute_latency   = (M * N * K) / macs_pc
-        
-        # 写入L0C的延迟
-        self.write_latency     = C_bytes / io_bw['AccumDFF→L0C'] 
+
+        self.load_A_latency = A_bytes / io_bw['L1→L0A']
+        self.load_B_latency = B_bytes / io_bw['L1→L0B']
+        self.compute_latency = (M * N * K) / macs_pc
+        self.write_latency = C_bytes / io_bw['AccumDFF→L0C']
 
 
 class UB_tile:
