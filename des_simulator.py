@@ -90,50 +90,69 @@ class PipelineSimulator:
         on_complete: Callable[[PipelineEvent], None] = None,
         metadata: Any = None,
     ) -> PipelineEvent:
-        deps = dependencies or [] # 前置依赖项
-        max_dep_end = max((dep.end_cycle for dep in deps), default=0.0) # 找到所有依赖的结束周期中的最大值
-        busy = self.pipeline_busy[pipeline] # 当前流水线上的已有的事件
-        limit = self.parallel_limit[pipeline] # 并发限制
-        pipeline_free = 0.0
-        
-        # 当前流水线已满的情况下，寻找最早的空闲时间
-        if len(busy) >= limit:
-            pipeline_free = max(evt.end_cycle for evt in busy)
-            
-        start = max(max_dep_end, pipeline_free, self.current_cycle) # 开始时间
-        
-        evt = PipelineEvent(op, level, pipeline, duration, deps, on_complete, metadata) # 创建事件
+        deps = dependencies or []
+        max_dep_end = max((dep.end_cycle for dep in deps), default=0.0)
+        limit = self.parallel_limit[pipeline]
+        # 使用每条流水线的最小堆来表示当前并发占用的结束时间
+        if not hasattr(self, '_pipe_end_heap'):
+            self._pipe_end_heap = {p: [] for p in Pipeline}
+        heap = self._pipe_end_heap[pipeline]
+
+        # 候选开始时间至少是依赖/当前时间
+        start = max(max_dep_end, self.current_cycle)
+
+        # 释放在 start 之前已结束的占用
+        while heap and heap[0] <= start:
+            import heapq
+            heapq.heappop(heap)
+
+        # 若并发已满且最早结束时间仍大于 start，则需要等到该时刻
+        if len(heap) >= limit:
+            earliest_end = heap[0]
+            if earliest_end > start:
+                start = earliest_end
+                import heapq
+                heapq.heappop(heap)
+
+        evt = PipelineEvent(op, level, pipeline, duration, deps, on_complete, metadata)
         evt.start_cycle = start
         evt.end_cycle = start + duration
-        
-        busy.append(evt) # 加入busy列表
+
+        # 新占用入堆
+        import heapq
+        heapq.heappush(heap, evt.end_cycle)
+
+        # 记录并入队
         if not hasattr(self, 'all_events'):
             self.all_events = []
         self.all_events.append(evt)
-        
         self.intervals[pipeline].append((evt.start_cycle, evt.end_cycle))
-    
+
         self._counter += 1
-        # 放入事件队列并按结束时间排序
         heapq.heappush(self.event_queue, (evt.end_cycle, self._counter, evt))
         return evt
 
 
+
     # 仿真启动器
     def run(self, max_cycles: float = float('inf')) -> float:
+        import heapq
         while self.event_queue and self.current_cycle < max_cycles:
             end_cycle, _, evt = heapq.heappop(self.event_queue)
             self.current_cycle = end_cycle
             if self.verbose and evt.level == TileLevel.CHIP and evt.op == OpType.MEM_TO_EXT:
                 meta_id = getattr(evt.metadata, 'id', None)
                 print(f"Chip_tile ID={meta_id} 完成 at 周期 {evt.end_cycle:.1f}")
-            self.pipeline_busy[evt.pipeline].remove(evt)
+            # 防守式移除，避免大列表 O(N) 失败导致卡顿
+            try:
+                self.pipeline_busy[evt.pipeline].remove(evt)
+            except ValueError:
+                pass
             if evt.on_complete:
                 evt.on_complete(evt)
         if self.verbose:
             print(f"*** Total cycles: {self.current_cycle:.1f} ***")
         return self.current_cycle
-    
 
 
     def run_with_breakdown(self, max_cycles: float = float('inf')):

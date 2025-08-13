@@ -3,7 +3,7 @@ from matmul import Simulate
 import des_simulator as ds
 from hardware import HW
 
-RAW_MNK  = [1026, 1536, 2176]      # [M, N, K]
+RAW_MNK  = [1114, 8064, 12288]      # [M, N, K]
 FORMATS  = ['fp16', 'fp16']      # [dtype A, dtype B]
 
 def report_once(strat, total_cycles, totals, union_out2, union_out12):
