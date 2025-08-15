@@ -75,6 +75,5 @@ class HardwareSpec:
         # L2 cache policy
         self.L2_ASSOCIATIVITY = 8
         self.L2_INPUT_RATIO   = 0.8
-        self.L2_FIXED_HIT_RATE = 0.95
-
+        self.L2_FIXED_HIT_RATE = None
 HW = HardwareSpec()

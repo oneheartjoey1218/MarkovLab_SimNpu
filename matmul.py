@@ -8,26 +8,101 @@ from des_simulator import OpType, TileLevel, Pipeline, PipelineSimulator
 
 
 # 划分矩阵乘法的策略
-def split_blocks(blocks, max_elems):
+def _split_blocks_by(blocks, fits_fn):
     """
-    对每个 (M,N,K) 二分拆分，直到 M*N*K <= max_elems。
-    优先沿最大维度二分。
+    Generic recursive splitter:
+    - blocks: iterable of (M,N,K)
+    - fits_fn: callable(M,N,K)->bool indicating whether the tile fits the target level capacity/policy
+    Splits along the largest dimension until fits_fn is True.
     """
     out = []
     for M, N, K in blocks:
-        if M * N * K <= max_elems:
+        if fits_fn(M, N, K):
             out.append((M, N, K))
+            continue
+        # choose the largest dimension to split
+        if M >= N and M >= K and M > 1:
+            m2 = max(1, M // 2)
+            out += _split_blocks_by([(m2, N, K), (M - m2, N, K)], fits_fn)
+        elif N >= K and N > 1:
+            n2 = max(1, N // 2)
+            out += _split_blocks_by([(M, n2, K), (M, N - n2, K)], fits_fn)
         else:
-            if M >= N and M >= K:
-                m2 = M // 2
-                out += split_blocks([(m2, N, K), (M-m2, N, K)], max_elems)
-            elif N >= K:
-                n2 = N // 2
-                out += split_blocks([(M, n2, K), (M, N-n2, K)], max_elems)
+            if K <= 1:
+                out.append((M, N, K))
             else:
-                k2 = K // 2
-                out += split_blocks([(M, N, k2), (M, N, K-k2)], max_elems)
+                k2 = max(1, K // 2)
+                out += _split_blocks_by([(M, N, k2), (M, N, K - k2)], fits_fn)
     return out
+
+def split_blocks_L2(blocks, elem_bytes):
+    """Capacity check at L2: must hold A+B+C simultaneously."""
+    L2_bytes = HW.L2_CAPACITY
+    def fits(M, N, K):
+        return ((M*K + K*N + M*N) * elem_bytes) <= L2_bytes
+    return _split_blocks_by(blocks, fits)
+
+def split_blocks_L1(blocks, elem_bytes):
+    """Capacity check at L1: typically holds A and B (no C residency).
+    Heuristic to avoid explosion of tiles: prefer keeping K large.
+    """
+    L1_bytes = HW.L1_CAPACITY
+    cap_elems = L1_bytes // elem_bytes
+    MIN_M = getattr(HW, "MIN_TILE_M", 16)
+    MIN_N = getattr(HW, "MIN_TILE_N", 16)
+    MIN_K = getattr(HW, "MIN_TILE_K", 16)
+    def fits(M, N, K):
+        return (M*K + K*N) <= cap_elems
+    def choose_split_dim(M, N, K):
+        mk = M*K; kn = K*N
+        if mk > cap_elems and kn > cap_elems:
+            return 'K'
+        if mk > cap_elems:
+            return 'M' if M > max(16, MIN_M) else 'K'
+        if kn > cap_elems:
+            return 'N' if N > max(16, MIN_N) else 'K'
+        if N >= M and N > max(16, MIN_N):
+            return 'N'
+        if M > max(16, MIN_M):
+            return 'M'
+        return 'K'
+    out = []
+    for M, N, K in blocks:
+        stack = [(M, N, K)]
+        while stack:
+            m, n, k = stack.pop()
+            if fits(m, n, k) or ((m <= MIN_M) and (n <= MIN_N) and (k <= MIN_K)):
+                out.append((m, n, k)); continue
+            dim = choose_split_dim(m, n, k)
+            if dim == 'M' and m > 1 and m > MIN_M:
+                m2 = max(MIN_M, m // 2)
+                if m2 >= m: m2 = max(1, m-1)
+                stack.append((m - m2, n, k)); stack.append((m2, n, k))
+            elif dim == 'N' and n > 1 and n > MIN_N:
+                n2 = max(MIN_N, n // 2)
+                if n2 >= n: n2 = max(1, n-1)
+                stack.append((m, n - n2, k)); stack.append((m, n2, k))
+            else:
+                if k <= 1:
+                    out.append((m, n, k))
+                else:
+                    k2 = max(MIN_K, k // 2)
+                    if k2 >= k: k2 = max(1, k-1)
+                    stack.append((m, n, k - k2)); stack.append((m, n, k2))
+    return out
+
+def split_blocks_L0(blocks, elem_bytes):
+    """Capacity check at L0: separate banks for A (L0A), B (L0B), and C (L0C)."""
+    A_cap = HW.L0A_CAPACITY
+    B_cap = HW.L0B_CAPACITY
+    C_cap = HW.L0C_CAPACITY
+    align16 = getattr(HW, "ALIGN_COMPUTE_16", False)
+    def fits(M, N, K):
+        if align16 and ((M % 16) or (N % 16) or (K % 16)):
+            return False
+        A = M*K*elem_bytes; B = K*N*elem_bytes; C = M*N*elem_bytes
+        return (A <= A_cap) and (B <= B_cap) and (C <= C_cap)
+    return _split_blocks_by(blocks, fits)
 
 
 class MatMul_Strategy:
@@ -92,37 +167,24 @@ class MatMul_Strategy:
         raise NotImplementedError("Ascend strategy generation is not implemented yet.")
 
     def generate_strategy(self):
-        """
-        最佳分块策略
-        1. Chip无需拆分
-        2. L2 - L2_CAPACITY
-        3. L1 - L1_CAPACITY
-        4. L0(L0=L0A/L0B) - L0x_CAPACITY
-        """
-        
         # 1) Chip
         self.chip_mnk_values = list(self.raw_mnk_values)
-        
+
         # 2) L2
-        max_L2 = self.chip_type.L2_CAPACITY // self.elem_bytes
-        self.L2_mnk_values = split_blocks(self.chip_mnk_values, max_L2)
+        self.L2_mnk_values = split_blocks_L2(self.chip_mnk_values, self.elem_bytes)
 
         # 3) L1
-        max_L1 = self.chip_type.L1_CAPACITY // self.elem_bytes
         self.L1_mnk_values = []
         for block in self.L2_mnk_values:
-            self.L1_mnk_values += split_blocks([block], max_L1)
-            
-        # 4) L0 (使用 L0A + L0B 容量中较小者)
-        max_L0A = self.chip_type.L0A_CAPACITY // self.elem_bytes
-        max_L0B = self.chip_type.L0B_CAPACITY // self.elem_bytes
-        max_L0  = min(max_L0A, max_L0B)
+            self.L1_mnk_values += split_blocks_L1([block], self.elem_bytes)
+
+        # 4) L0
         self.L0_mnk_values = []
         for block in self.L1_mnk_values:
-            self.L0_mnk_values += split_blocks([block], max_L0)
-            
+            self.L0_mnk_values += split_blocks_L0([block], self.elem_bytes)
+
         # DFF
-        self.DFF_mnk_values = list(self.L0_mnk_values[0])  # DFF与L0通用
+        self.DFF_mnk_values = [16, 16, 16]
 
     def calculate_cycles(self):
         # 本层无计算
@@ -175,52 +237,18 @@ class Simulate:
 
     def build_tiles(self):
         """
-        构建 self.tiles（三维 Chip_tile 数组），并对每个 tile 调用 build_subtiles()。
+        构建 self.tiles（三维 Chip_tile 数组）。
+        Chip 级固定为单一整块；实际切分在 Chip_tile.build_subtiles() 里做 L1/L0。
         """
-        from math import ceil
         import numpy as np
 
-        # 1) 计算完整块数与边界余数
-        M_l2 = self.M // self.M_tile
-        N_l2 = self.N // self.N_tile
-        K_l2 = self.K // self.K_tile
-        M_rem = self.M % self.M_tile
-        N_rem = self.N % self.N_tile
-        K_rem = self.K % self.K_tile
-
-        # 2) 分配空数组
-        dims = [
-            ceil(self.M / self.M_tile),
-            ceil(self.N / self.N_tile),
-            ceil(self.K / self.K_tile),
-        ]
-        self.tiles = np.empty(dims, dtype=object)
-
-        # 3) 批量初始化完整分块
+        # 单一 chip tile（整块 MNK）
         block = self.create_chip_tile(self.M_tile, self.N_tile, self.K_tile)
-        if M_l2 and N_l2 and K_l2:
-            self.tiles[:M_l2, :N_l2, :K_l2] = block
+        self.tiles = np.empty((1, 1, 1), dtype=object)
+        self.tiles[0, 0, 0] = block
 
-        # 4) 各方向边界
-        if M_rem:
-            self.tiles[-1, :N_l2, :K_l2] = self.create_chip_tile(M_rem, self.N_tile, self.K_tile)
-        if N_rem:
-            self.tiles[:M_l2, -1, :K_l2] = self.create_chip_tile(self.M_tile, N_rem, self.K_tile)
-        if K_rem:
-            self.tiles[:M_l2, :N_l2, -1] = self.create_chip_tile(self.M_tile, self.N_tile, K_rem)
-        if M_rem and N_rem:
-            self.tiles[-1, -1, :K_l2] = self.create_chip_tile(M_rem, N_rem, self.K_tile)
-        if M_rem and K_rem:
-            self.tiles[-1, :N_l2, -1] = self.create_chip_tile(M_rem, self.N_tile, K_rem)
-        if N_rem and K_rem:
-            self.tiles[:M_l2, -1, -1] = self.create_chip_tile(self.M_tile, N_rem, K_rem)
-        if M_rem and N_rem and K_rem:
-            self.tiles[-1, -1, -1] = self.create_chip_tile(M_rem, N_rem, K_rem)
-
-        # 5) 为每个 Chip_tile 生成 L1/L0 子块
-        for chip in self.tiles.flatten():
-            if chip is not None:
-                chip.build_subtiles()
+        # 为该 Chip_tile 生成 L1/L0 子块
+        block.build_subtiles()
                     
     def load_look_up_table(self):
         # 这里需要根据实际情况加载查找表
@@ -850,19 +878,15 @@ class Chip_tile:
         
     def build_subtiles(self):
         """
-        在每个 Chip_tile 上，按照 L1 缓存容量切分出 l1_tiles，
-        并为每个 L1_tile 调用 build_subtiles() 生成对应的 L0_tile。
+        在当前 Chip_tile 上，按照 L1 容量将 (M,N,K) 切成多个 L1_tile，
+        并为每个 L1_tile 继续生成对应的 L0_tile。
         """
-        from matmul import split_blocks, L1_tile
-
-        # L1 切分
-        max_L1 = self.strategy.chip_type.L1_CAPACITY // self.elem_bytes
+        # 直接调用同文件内的分层切分函数，避免 "from matmul import ..." 的循环导入
         self.l1_tiles = []
         for idx, (m1, n1, k1) in enumerate(
-            split_blocks([(self.M_tile, self.N_tile, self.K_tile)], max_L1)
+            split_blocks_L1([(self.M_tile, self.N_tile, self.K_tile)], self.elem_bytes)
         ):
             l1 = L1_tile(id=idx, strategy=self.strategy, M=m1, N=n1, K=k1)
-            # 生成 L0 级子块
             l1.build_subtiles()
             self.l1_tiles.append(l1)
             
@@ -894,24 +918,14 @@ class L1_tile:
         """
         为当前 L1_tile 切分 L0_tile 并填充 self.l0_tiles
         """
-        from matmul import split_blocks, L0_tile # 导入L0_tile类与切分函数
-        
-        # 根据L0A和L0B容量，计算每个L0子tile可容纳的最大元素数
-        max_L0A = self.strategy.chip_type.L0A_CAPACITY // self.elem_bytes
-        max_L0B = self.strategy.chip_type.L0B_CAPACITY // self.elem_bytes
-        max_L0  = min(max_L0A, max_L0B)
-        
-        self.l0_tiles = [] # 初始化 L0 子 tile 列表
-        
-        # 使用split_blocks对当前L1 tile的M×N×K进行切分，得到多个L0子块
+        self.l0_tiles = []
         for idx, (m0, n0, k0) in enumerate(
-            split_blocks([(self.M_tile, self.N_tile, self.K_tile)], max_L0)
+            split_blocks_L0([(self.M_tile, self.N_tile, self.K_tile)], self.elem_bytes)
         ):
-            # 构建 L0_tile 并加入列表
             self.l0_tiles.append(
                 L0_tile(id=idx, strategy=self.strategy, M=m0, N=n0, K=k0)
             )
-    
+        
 class L0_tile:
     def __init__(self, id: int, strategy: 'MatMul_Strategy', M: int, N: int, K: int):
         self.id = id

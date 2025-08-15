@@ -2,6 +2,7 @@ from enum import Enum
 from dataclasses import dataclass
 import heapq
 from typing import List, Dict, Callable, Any, Tuple
+from hardware import HW
 
 LAST_SIM = None
 # 定义各个流水线阶段的类
@@ -93,12 +94,13 @@ class PipelineSimulator:
         deps = dependencies or []
         max_dep_end = max((dep.end_cycle for dep in deps), default=0.0)
         limit = self.parallel_limit[pipeline]
-        # 使用每条流水线的最小堆来表示当前并发占用的结束时间
+
+        # 每条流水线一个最小堆，记录并发中的“结束时间”
         if not hasattr(self, '_pipe_end_heap'):
             self._pipe_end_heap = {p: [] for p in Pipeline}
         heap = self._pipe_end_heap[pipeline]
 
-        # 候选开始时间至少是依赖/当前时间
+        # 候选开始时间：不早于依赖/当前时间
         start = max(max_dep_end, self.current_cycle)
 
         # 释放在 start 之前已结束的占用
@@ -106,7 +108,7 @@ class PipelineSimulator:
             import heapq
             heapq.heappop(heap)
 
-        # 若并发已满且最早结束时间仍大于 start，则需要等到该时刻
+        # 并发已满 → 推迟到最早结束时刻
         if len(heap) >= limit:
             earliest_end = heap[0]
             if earliest_end > start:
@@ -116,19 +118,19 @@ class PipelineSimulator:
 
         evt = PipelineEvent(op, level, pipeline, duration, deps, on_complete, metadata)
         evt.start_cycle = start
-        evt.end_cycle = start + duration
+        evt.end_cycle   = start + duration
 
-        # 新占用入堆
         import heapq
         heapq.heappush(heap, evt.end_cycle)
 
-        # 记录并入队
-        if not hasattr(self, 'all_events'):
-            self.all_events = []
-        self.all_events.append(evt)
+        # 仅记录时间区间（做并集统计），不再堆积所有事件对象以省内存
         self.intervals[pipeline].append((evt.start_cycle, evt.end_cycle))
 
+        # 事件计数 + 上限保护
         self._counter += 1
+        if self._counter > getattr(HW, 'MAX_EVENTS', 3000000):
+            raise RuntimeError(f'Event cap exceeded: {self._counter}')
+
         heapq.heappush(self.event_queue, (evt.end_cycle, self._counter, evt))
         return evt
 
