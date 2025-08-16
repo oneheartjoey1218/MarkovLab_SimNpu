@@ -47,8 +47,8 @@ class HardwareSpec:
 
         l2_to_l1_bpc   = tbps_to_bpc(4.07)
         dram_to_l2_bpc = tbps_to_bpc(1.35)
-        l1_to_l0a_bpc  = gbps_to_bpc(220.0)
-        l1_to_l0b_bpc  = gbps_to_bpc(440.0)
+        l1_to_l0a_bpc  = gbps_to_bpc(440.0)
+        l1_to_l0b_bpc  = gbps_to_bpc(220.0)
 
         self.IO_BW = {
             'DRAM→L2': float(dram_to_l2_bpc),

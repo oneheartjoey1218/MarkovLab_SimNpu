@@ -9,12 +9,6 @@ from des_simulator import OpType, TileLevel, Pipeline, PipelineSimulator
 
 # 划分矩阵乘法的策略
 def _split_blocks_by(blocks, fits_fn):
-    """
-    Generic recursive splitter:
-    - blocks: iterable of (M,N,K)
-    - fits_fn: callable(M,N,K)->bool indicating whether the tile fits the target level capacity/policy
-    Splits along the largest dimension until fits_fn is True.
-    """
     out = []
     for M, N, K in blocks:
         if fits_fn(M, N, K):
@@ -36,63 +30,87 @@ def _split_blocks_by(blocks, fits_fn):
     return out
 
 def split_blocks_L2(blocks, elem_bytes):
-    """Capacity check at L2: must hold A+B+C simultaneously."""
     L2_bytes = HW.L2_CAPACITY
     def fits(M, N, K):
         return ((M*K + K*N + M*N) * elem_bytes) <= L2_bytes
     return _split_blocks_by(blocks, fits)
 
 def split_blocks_L1(blocks, elem_bytes):
-    """Capacity check at L1: typically holds A and B (no C residency).
-    Heuristic to avoid explosion of tiles: prefer keeping K large.
-    """
-    L1_bytes = HW.L1_CAPACITY
-    cap_elems = L1_bytes // elem_bytes
-    MIN_M = getattr(HW, "MIN_TILE_M", 16)
-    MIN_N = getattr(HW, "MIN_TILE_N", 16)
-    MIN_K = getattr(HW, "MIN_TILE_K", 16)
+    L1_bytes   = HW.L1_CAPACITY
+    cap_elems  = L1_bytes // elem_bytes
+    MIN_M      = getattr(HW, "MIN_TILE_M", 64)
+    MIN_N      = getattr(HW, "MIN_TILE_N", 64)
+    MIN_K      = getattr(HW, "MIN_TILE_K", 128)
+    MAX_TILES  = getattr(HW, "MAX_L1_TILES", 4096)  # 可在 hardware.py 里设置；没有就用缺省
+
     def fits(M, N, K):
         return (M*K + K*N) <= cap_elems
+
     def choose_split_dim(M, N, K):
-        mk = M*K; kn = K*N
+        mk = M * K
+        kn = K * N
+        # 两者都超：优先从更大的 M/N 下手，最后才切 K
         if mk > cap_elems and kn > cap_elems:
+            if N >= M and N > MIN_N:
+                return 'N'
+            if M > MIN_M:
+                return 'M'
             return 'K'
         if mk > cap_elems:
-            return 'M' if M > max(16, MIN_M) else 'K'
+            return 'M' if M > MIN_M else 'K'
         if kn > cap_elems:
-            return 'N' if N > max(16, MIN_N) else 'K'
-        if N >= M and N > max(16, MIN_N):
+            return 'N' if N > MIN_N else 'K'
+        # 单独都不超但整体还不 fit：切更大的 M/N
+        if N >= M and N > MIN_N:
             return 'N'
-        if M > max(16, MIN_M):
+        if M > MIN_M:
             return 'M'
         return 'K'
+
     out = []
+    est_tiles = 0  # 估计切分产生的 tile 数，避免超过上限
     for M, N, K in blocks:
         stack = [(M, N, K)]
         while stack:
             m, n, k = stack.pop()
+
+            # 已 fit 或已达到最小粒度 → 直接落地
             if fits(m, n, k) or ((m <= MIN_M) and (n <= MIN_N) and (k <= MIN_K)):
-                out.append((m, n, k)); continue
+                out.append((m, n, k))
+                est_tiles += 1
+                if est_tiles >= MAX_TILES:
+                    # 到达上限，清空 stack，直接落地剩余块（防指数爆炸）
+                    out.extend([t for t in stack])
+                    stack.clear()
+                continue
+
+            # 若继续切会超过上限 → 直接落地当前块
+            if est_tiles + len(stack) + 1 >= MAX_TILES:
+                out.append((m, n, k))
+                est_tiles += 1
+                continue
+
             dim = choose_split_dim(m, n, k)
             if dim == 'M' and m > 1 and m > MIN_M:
                 m2 = max(MIN_M, m // 2)
-                if m2 >= m: m2 = max(1, m-1)
+                if m2 >= m: m2 = max(1, m - 1)
                 stack.append((m - m2, n, k)); stack.append((m2, n, k))
             elif dim == 'N' and n > 1 and n > MIN_N:
                 n2 = max(MIN_N, n // 2)
-                if n2 >= n: n2 = max(1, n-1)
+                if n2 >= n: n2 = max(1, n - 1)
                 stack.append((m, n - n2, k)); stack.append((m, n2, k))
             else:
+                # 切 K（最后手段）
                 if k <= 1:
                     out.append((m, n, k))
+                    est_tiles += 1
                 else:
                     k2 = max(MIN_K, k // 2)
-                    if k2 >= k: k2 = max(1, k-1)
+                    if k2 >= k: k2 = max(1, k - 1)
                     stack.append((m, n, k - k2)); stack.append((m, n, k2))
     return out
 
 def split_blocks_L0(blocks, elem_bytes):
-    """Capacity check at L0: separate banks for A (L0A), B (L0B), and C (L0C)."""
     A_cap = HW.L0A_CAPACITY
     B_cap = HW.L0B_CAPACITY
     C_cap = HW.L0C_CAPACITY
@@ -122,9 +140,6 @@ class MatMul_Strategy:
     DFF_storage_formats = None
     
     def __init__(self, dataflow_mode, raw_mnk_values, raw_storage_formats, option=None, chip_type:'HardwareSpec' = HW):
-        """
-        Initialize the strategy with dataflow mode, raw MNK values, and raw storage formats.
-        """
         self.dataflow_mode = dataflow_mode
         self.raw_mnk_values = raw_mnk_values  # 原始矩阵MNK值，数据格式为列表：[M, N, K]
         self.raw_storage_format = raw_storage_formats  # 原始矩阵存储格式，数据格式为字符串列表：[左矩阵格式,右矩阵格式]，两个格式的选择为0和1（或者False和True，True表示特殊处理格式）
