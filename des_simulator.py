@@ -60,6 +60,7 @@ class PipelineSimulator:
         self._counter: int = 0
         self.verbose = verbose
         self.intervals = {p: [] for p in Pipeline}
+        self.op_intervals = {op: [] for op in OpType}
 
     # 计算给定流水线集合的并集时长（cycles）
     def union_cycles_of(self, include):
@@ -108,7 +109,7 @@ class PipelineSimulator:
             import heapq
             heapq.heappop(heap)
 
-        # 并发已满 → 推迟到最早结束时刻
+        # 并发已满，推迟到最早结束时刻
         if len(heap) >= limit:
             earliest_end = heap[0]
             if earliest_end > start:
@@ -125,6 +126,7 @@ class PipelineSimulator:
 
         # 仅记录时间区间（做并集统计），不再堆积所有事件对象以省内存
         self.intervals[pipeline].append((evt.start_cycle, evt.end_cycle))
+        self.op_intervals[op].append((evt.start_cycle, evt.end_cycle))
 
         # 事件计数 + 上限保护
         self._counter += 1
@@ -159,8 +161,8 @@ class PipelineSimulator:
 
     def run_with_breakdown(self, max_cycles: float = float('inf')):
         """
-        运行仿真，返回总周期, 各流水线的忙碌周期
-        忙碌时间用事件时间区间的并集
+        运行仿真，返回：
+          total_cycles, per-pipeline busy union cycles, per-op busy union cycles
         """
         total_cycles = self.run(max_cycles)
 
@@ -178,11 +180,12 @@ class PipelineSimulator:
                     cur_s, cur_e = s, e
             merged.append((cur_s, cur_e))
             return sum(e - s for s, e in merged)
-        totals = {p: union_length(self.intervals[p]) for p in Pipeline}
+
+        totals_pipe = {p: union_length(self.intervals[p]) for p in Pipeline}
+        totals_ops  = {op: union_length(self.op_intervals[op]) for op in OpType}
         global LAST_SIM
         LAST_SIM = self
-
-        return total_cycles, totals
+        return total_cycles, totals_pipe, totals_ops
 
     
 

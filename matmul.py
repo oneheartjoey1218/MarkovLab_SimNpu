@@ -14,7 +14,6 @@ def _split_blocks_by(blocks, fits_fn):
         if fits_fn(M, N, K):
             out.append((M, N, K))
             continue
-        # choose the largest dimension to split
         if M >= N and M >= K and M > 1:
             m2 = max(1, M // 2)
             out += _split_blocks_by([(m2, N, K), (M - m2, N, K)], fits_fn)
@@ -41,7 +40,7 @@ def split_blocks_L1(blocks, elem_bytes):
     MIN_M      = getattr(HW, "MIN_TILE_M", 64)
     MIN_N      = getattr(HW, "MIN_TILE_N", 64)
     MIN_K      = getattr(HW, "MIN_TILE_K", 128)
-    MAX_TILES  = getattr(HW, "MAX_L1_TILES", 4096)  # 可在 hardware.py 里设置；没有就用缺省
+    MAX_TILES  = getattr(HW, "MAX_L1_TILES", 4096)
 
     def fits(M, N, K):
         return (M*K + K*N) <= cap_elems
@@ -68,23 +67,18 @@ def split_blocks_L1(blocks, elem_bytes):
         return 'K'
 
     out = []
-    est_tiles = 0  # 估计切分产生的 tile 数，避免超过上限
+    est_tiles = 0
     for M, N, K in blocks:
         stack = [(M, N, K)]
         while stack:
             m, n, k = stack.pop()
-
-            # 已 fit 或已达到最小粒度 → 直接落地
             if fits(m, n, k) or ((m <= MIN_M) and (n <= MIN_N) and (k <= MIN_K)):
                 out.append((m, n, k))
                 est_tiles += 1
                 if est_tiles >= MAX_TILES:
-                    # 到达上限，清空 stack，直接落地剩余块（防指数爆炸）
                     out.extend([t for t in stack])
                     stack.clear()
                 continue
-
-            # 若继续切会超过上限 → 直接落地当前块
             if est_tiles + len(stack) + 1 >= MAX_TILES:
                 out.append((m, n, k))
                 est_tiles += 1
@@ -100,7 +94,6 @@ def split_blocks_L1(blocks, elem_bytes):
                 if n2 >= n: n2 = max(1, n - 1)
                 stack.append((m, n - n2, k)); stack.append((m, n2, k))
             else:
-                # 切 K（最后手段）
                 if k <= 1:
                     out.append((m, n, k))
                     est_tiles += 1
@@ -441,151 +434,170 @@ class Simulate:
 
     
     def calculate_pipelined_cycles_with_breakdown(self):
-            if not hasattr(self, 'look_up_table') or self.look_up_table is None:
-                self.load_look_up_table()
-            self.validate_cache_capacity()
-            self.build_tiles()
+                if not hasattr(self, 'look_up_table') or self.look_up_table is None:
+                    self.load_look_up_table()
+                self.validate_cache_capacity()
+                self.build_tiles()
 
-            from des_simulator import PipelineSimulator, Pipeline, OpType, TileLevel
-            ai = self.strategy.chip_type.AI_CORE_COUNT
-            parallel_limit = {
-                Pipeline.OUT2: 1,
-                Pipeline.OUT1: 1,
-                Pipeline.FIX:  ai,
-                Pipeline.MTE2: ai,
-                Pipeline.MTE1: ai,
-                Pipeline.M:    ai,
-            }
-            sim = PipelineSimulator(parallel_limit)
+                from des_simulator import PipelineSimulator, Pipeline, OpType, TileLevel
+                ai = self.strategy.chip_type.AI_CORE_COUNT
+                parallel_limit = {
+                    Pipeline.OUT2: 1,
+                    Pipeline.OUT1: 1,
+                    Pipeline.FIX:  ai,
+                    Pipeline.MTE2: ai,
+                    Pipeline.MTE1: ai,
+                    Pipeline.M:    ai,
+                }
+                sim = PipelineSimulator(parallel_limit)
 
-            # 形状信息
-            M_tiles, N_tiles, K_tiles = self.tiles.shape
+                # 形状信息
+                M_tiles, N_tiles, K_tiles = self.tiles.shape
 
-            # —— 核映射（行分组 RR）——
-            row_grp = max(1, min(ai, M_tiles))
-            while ai % row_grp != 0 and row_grp > 1:
-                row_grp //= 2
-            cores_per_row = ai // row_grp
-            core_map = {}
-            for m in range(M_tiles):
-                base = (m % row_grp) * cores_per_row
-                for n in range(N_tiles):
-                    core_map[(m, n)] = base + (n % cores_per_row)
+                # —— 核映射（行分组 RR）——
+                row_grp = max(1, min(ai, M_tiles))
+                while ai % row_grp != 0 and row_grp > 1:
+                    row_grp //= 2
+                cores_per_row = ai // row_grp
+                core_map = {}
+                for m in range(M_tiles):
+                    base = (m % row_grp) * cores_per_row
+                    for n in range(N_tiles):
+                        core_map[(m, n)] = base + (n % cores_per_row)
 
-            def assign_core(m, n):
-                return core_map[(m, n)]
-            c_state_ready_in_l0c = {}
-            c_state_ready_in_accum = {}
-            
-            def cb_compute_batch(evt_batch):
-                # evt_batch.metadata = (indexed_l0_list, (m,n,k))
-                indexed_l0_list, coord = evt_batch.metadata
-                m, n, k = coord
-                for idx, l0 in indexed_l0_list:
+                def assign_core(m, n):
+                    return core_map[(m, n)]
+                c_state_ready_in_l0c = {}
+                c_state_ready_in_accum = {}
+                
+                def cb_compute_batch(evt_batch):
+                    # evt_batch.metadata = (indexed_l0_list, (m,n,k))
+                    indexed_l0_list, coord = evt_batch.metadata
+                    m, n, k = coord
+                    for idx, l0 in indexed_l0_list:
+                        C_bytes = l0.M_tile * l0.N_tile * l0.elem_bytes
+                        parents = [evt_batch]
+                        key = (m, n, idx)
+
+                        # 对于 k >= 1：在开始计算前必须把先前部分和从 L0C 搬回 Accum
+                        if k > 0:
+                            prev_ready = c_state_ready_in_l0c.get(key)
+                            if prev_ready is not None:
+                                prep = sim.add_event(
+                                    OpType.L0C_TO_ACCUM, TileLevel.L0, Pipeline.MTE1,
+                                    _device.io.load(C_bytes, 'L0C', 'AccumDFF'),
+                                    [prev_ready]
+                                )
+                                parents = [prep]
+
+                        sim.add_event(
+                            OpType.CUBE_GEMM, TileLevel.CUBE, Pipeline.M,
+                            l0.compute_latency,
+                            parents, on_complete=cb_write, metadata=(idx, l0, coord)
+                        )
+
+                def cb_l0(evt_l1):
+                    # evt_l1.metadata = (l1, coord)
+                    l1, coord = evt_l1.metadata
+                    l0_list = list(enumerate(l1.l0_tiles))
+                    batch_dur = max((max(l0.load_A_latency, l0.load_B_latency) for _, l0 in l0_list))
+                    sim.add_event(
+                        OpType.L1_TO_L0AB, TileLevel.L0, Pipeline.MTE1,
+                        batch_dur, [evt_l1], on_complete=cb_compute_batch, metadata=(l0_list, coord)
+                    )
+
+                def cb_write(evt_m):
+                    # evt_m.metadata = (idx, l0, (m,n,k))
+                    idx, l0, coord = evt_m.metadata
+                    m, n, k = coord
                     C_bytes = l0.M_tile * l0.N_tile * l0.elem_bytes
-                    parents = [evt_batch]
                     key = (m, n, idx)
 
-                    # 对于 k >= 1：在开始计算前必须把先前部分和从 L0C 搬回 Accum
-                    if k > 0:
-                        prev_ready = c_state_ready_in_l0c.get(key)
-                        if prev_ready is not None:
-                            prep = sim.add_event(
-                                OpType.L0C_TO_ACCUM, TileLevel.L0, Pipeline.MTE1,
-                                _device.io.load(C_bytes, 'L0C', 'AccumDFF'),
-                                [prev_ready]
-                            )
-                            parents = [prep]
+                    # 本次 k 计算完成后：把最新的部分和从 Accum 回写到 L0C（持久化）
+                    e_acc_to_l0c = sim.add_event(
+                        OpType.ACCUM_TO_L0C, TileLevel.L0, Pipeline.MTE1,
+                        _device.io.store(C_bytes, 'AccumDFF', 'L0C'), [evt_m], metadata=l0
+                    )
+                    c_state_ready_in_l0c[key] = e_acc_to_l0c
 
-                    sim.add_event(
-                        OpType.CUBE_GEMM, TileLevel.CUBE, Pipeline.M,
-                        l0.compute_latency,
-                        parents, on_complete=cb_write, metadata=(idx, l0, coord)
+                    # === 新增：立即加入一次对称的 L0C→Accum（同带宽、同数据量）===
+                    # 这样即使 chip 级 K_tiles=1，也会把 L0C_TO_ACCUM 真实计入耗时与并发占用
+                    e_l0c_to_accum = sim.add_event(
+                        OpType.L0C_TO_ACCUM, TileLevel.L0, Pipeline.MTE1,
+                        _device.io.load(C_bytes, 'L0C', 'AccumDFF'), [e_acc_to_l0c], metadata=l0
                     )
 
-            def cb_l0(evt_l1):
-                # evt_l1.metadata = (l1, coord)
-                l1, coord = evt_l1.metadata
-                l0_list = list(enumerate(l1.l0_tiles))
-                batch_dur = max((max(l0.load_A_latency, l0.load_B_latency) for _, l0 in l0_list))
-                sim.add_event(
-                    OpType.L1_TO_L0AB, TileLevel.L0, Pipeline.MTE1,
-                    batch_dur, [evt_l1], on_complete=cb_compute_batch, metadata=(l0_list, coord)
-                )
-
-            def cb_write(evt_m):
-                # evt_m.metadata = (idx, l0, (m,n,k))
-                idx, l0, coord = evt_m.metadata
-                m, n, k = coord
-                C_bytes = l0.M_tile * l0.N_tile * l0.elem_bytes
-                key = (m, n, idx)
-
-                # 本次 k 计算完成后：把最新的部分和从 Accum 回写到 L0C（持久化）
-                e_acc_to_l0c = sim.add_event(
-                    OpType.ACCUM_TO_L0C, TileLevel.L0, Pipeline.MTE1,
-                    _device.io.store(C_bytes, 'AccumDFF', 'L0C'), [evt_m], metadata=l0
-                )
-                c_state_ready_in_l0c[key] = e_acc_to_l0c
-
-                # 若已是该 (m,n) 的最后一个 K-slice，则一次性写出
-                if k == K_tiles - 1:
-                    e_l0c_l2 = sim.add_event(
-                        OpType.L0C_TO_L2, TileLevel.L1, Pipeline.FIX,
-                        _device.io.store(C_bytes, 'L0C', 'L2'), [e_acc_to_l0c], metadata=l0
-                    )
-                    if not getattr(HW, 'DEFER_OUT1_TO_END', False):
-                        e_out1 = sim.add_event(
-                            OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
-                            _device.io.store(C_bytes, 'L2', 'DRAM'), [e_l0c_l2], metadata=l0
+                    # 若已是该 (m,n) 的最后一个 K-slice，则一次性写出
+                    if k == K_tiles - 1:
+                        e_l0c_l2 = sim.add_event(
+                            OpType.L0C_TO_L2, TileLevel.L1, Pipeline.FIX,
+                            _device.io.store(C_bytes, 'L0C', 'L2'), [e_acc_to_l0c], metadata=l0
                         )
+                        if not getattr(HW, 'DEFER_OUT1_TO_END', False):
+                            e_out1 = sim.add_event(
+                                OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
+                                _device.io.store(C_bytes, 'L2', 'DRAM'), [e_l0c_l2], metadata=l0
+                            )
+                            sim.add_event(
+                                OpType.MEM_TO_EXT, TileLevel.CHIP, Pipeline.OUT2,
+                                _device.io.store(C_bytes, 'DRAM', 'EXT'), [e_out1], metadata=l0
+                            )
+
+                def cb_l1(evt_chip):
+                    # evt_chip.metadata = (chip_tile, (m,n,k))
+                    chip, coord = evt_chip.metadata
+                    m, n, k = coord
+                    core_id = assign_core(m, n)
+                    # 基于 L2_CACHE_MGR 的真实加载时间（含命中/未命中）
+                    for l1 in chip.l1_tiles:
+                        stride = HW.MIN_ACCESS['L2']
+                        a_addr = ((m * N_tiles + n) * K_tiles + k) * stride
+                        b_addr = ((n * M_tiles + m) * K_tiles + k) * stride
+                        a_lat = L2_CACHE_MGR.read(core_id, a_addr, l1.M_tile * l1.K_tile * l1.elem_bytes)
+                        b_lat = L2_CACHE_MGR.read(core_id, b_addr, l1.K_tile * l1.N_tile * l1.elem_bytes)
+                        load_lat = max(a_lat, b_lat)
+                        sim.add_event(
+                            OpType.MEM_TO_L2_L1, TileLevel.L1, Pipeline.MTE2,
+                            load_lat, [evt_chip], on_complete=cb_l0, metadata=(l1, coord)
+                        )
+
+                # 4) 首批 Chip 级事件：按 K→M→N 遍历，让相同 (m,n) 的多 K-slice 在时间轴上串起来
+                dim0, dim1, dim2 = self.tiles.shape
+                for k in range(dim2):
+                    for m in range(dim0):
+                        for n in range(dim1):
+                            chip = self.tiles[m, n, k]
+                            if not chip:
+                                continue
+                            # 外部→芯片（OUT2）：把 A/B 送到芯片，完成后再进入 L2/L1
+                            lat = max(chip.out2_A, chip.out2_B)
+                            sim.add_event(
+                                OpType.EXT_TO_MEM, TileLevel.CHIP, Pipeline.OUT2,
+                                lat, [], on_complete=cb_l1, metadata=(chip, (m, n, k))
+                            )
+
+                # If deferring OUT1/OUT2, flush per-core cached C once all tiles have been computed
+                if getattr(HW, 'DEFER_OUT1_TO_END', False):
+                    out1_events = []
+                    for core_id in range(self.strategy.chip_type.AI_CORE_COUNT):
+                        lat = L2_CACHE_MGR.flush(core_id)
+                        if lat > 0:
+                            e = sim.add_event(
+                                OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
+                                lat, [], metadata={'core': core_id}
+                            )
+                            out1_events.append(e)
+                    # 全部 OUT1 完成后，只发起一次 DRAM→EXT（bulk）
+                    if getattr(HW, 'DEFER_OUT2_TO_END', False):
+                        total_C_bytes = self.M * self.N * self.elem_bytes
+                        from modules import align
+                        aligned = align(total_C_bytes, HW.MIN_ACCESS['DRAM'])
                         sim.add_event(
                             OpType.MEM_TO_EXT, TileLevel.CHIP, Pipeline.OUT2,
-                            _device.io.store(C_bytes, 'DRAM', 'EXT'), [e_out1], metadata=l0
+                            _device.io.store(aligned, 'DRAM', 'EXT'), out1_events, metadata={'bulk': True}
                         )
+                return sim.run_with_breakdown()
 
-            def cb_l1(evt_chip):
-                # evt_chip.metadata = (chip_tile, (m,n,k))
-                chip, coord = evt_chip.metadata
-                m, n, k = coord
-                core_id = assign_core(m, n)
-                # 基于 L2_CACHE_MGR 的真实加载时间（含命中/未命中）
-                for l1 in chip.l1_tiles:
-                    stride = HW.MIN_ACCESS['L2']
-                    a_addr = ((m * N_tiles + n) * K_tiles + k) * stride
-                    b_addr = ((n * M_tiles + m) * K_tiles + k) * stride
-                    a_lat = L2_CACHE_MGR.read(core_id, a_addr, l1.M_tile * l1.K_tile * l1.elem_bytes)
-                    b_lat = L2_CACHE_MGR.read(core_id, b_addr, l1.K_tile * l1.N_tile * l1.elem_bytes)
-                    load_lat = max(a_lat, b_lat)
-                    sim.add_event(
-                        OpType.MEM_TO_L2_L1, TileLevel.L1, Pipeline.MTE2,
-                        load_lat, [evt_chip], on_complete=cb_l0, metadata=(l1, coord)
-                    )
-
-            # 4) 首批 Chip 级事件：按 K→M→N 遍历，让相同 (m,n) 的多 K-slice 在时间轴上串起来
-            dim0, dim1, dim2 = self.tiles.shape
-            for k in range(dim2):
-                for m in range(dim0):
-                    for n in range(dim1):
-                        chip = self.tiles[m, n, k]
-                        if not chip:
-                            continue
-                        # 外部→芯片（OUT2）：把 A/B 送到芯片，完成后再进入 L2/L1
-                        lat = max(chip.out2_A, chip.out2_B)
-                        sim.add_event(
-                            OpType.EXT_TO_MEM, TileLevel.CHIP, Pipeline.OUT2,
-                            lat, [], on_complete=cb_l1, metadata=(chip, (m, n, k))
-                        )
-
-            # If deferring OUT1/OUT2, flush per-core cached C once all tiles have been computed
-            if getattr(HW, 'DEFER_OUT1_TO_END', False):
-                for core_id in range(self.strategy.chip_type.AI_CORE_COUNT):
-                    lat = L2_CACHE_MGR.flush(core_id)
-                    if lat > 0:
-                        sim.add_event(
-                            OpType.L2_TO_MEM, TileLevel.CHIP, Pipeline.OUT1,
-                            lat, [], metadata={'core': core_id}
-                        )
-            return sim.run_with_breakdown()
 
 
 
@@ -762,71 +774,44 @@ class PipelineScheduler:
         m, n, k = coord
         tile      = self.chip_tiles[m, n, k]
         C_bytes = tile.M_tile * tile.N_tile * tile.elem_bytes
-        '''
-        chip_tile = self.chip_tiles[m, n, k]
-        A = chip_tile.M * chip_tile.K * chip_tile.elem_bytes
-        B = chip_tile.K * chip_tile.N * chip_tile.elem_bytes
-        C = chip_tile.M * chip_tile.N * chip_tile.elem_bytes
-        '''
         lut = getattr(self.sim, 'look_up_table', {})
         key = (tile.M_tile, tile.N_tile, tile.K_tile)
-        
-        # 重用判断：根据上次调度的 tile 坐标
+
+        # 正确的 L1 复用判定
         prev = self.prev_coord[stage_id]
         if prev is None:
             load_A = load_B = 1
         else:
             pm, pn, pk = prev
-            load_A = 1 if (n != pn or k != pk) else 0
-            load_B = 1 if (m != pm or k != pk) else 0
+            # A (M×K) 与 N 无关 → m,k 相同即可复用
+            # B (K×N) 与 M 无关 → n,k 相同即可复用
+            load_A = 0 if (m == pm and k == pk) else 1
+            load_B = 0 if (n == pn and k == pk) else 1
 
-        if stage_id == 0: # OUT2
-            # A
-            if key in lut and 'out2_A' in lut[key]:
-                a_lat = lut[key]['out2_A']
-            else:
-                a_lat = tile.out2_A
-            # B
-            if key in lut and 'out2_B' in lut[key]:
-                b_lat = lut[key]['out2_B']
-            else:
-                b_lat = tile.out2_B
+        if stage_id == 0:  # OUT2
+            a_lat = lut.get(key, {}).get('out2_A', tile.out2_A)
+            b_lat = lut.get(key, {}).get('out2_B', tile.out2_B)
             base = load_A * a_lat + load_B * b_lat
-            
-        elif stage_id == 1: # OUT1
+        elif stage_id == 1:  # OUT1
             core_id = self._assign_core(m, n, k)
             base = L2_CACHE_MGR.flush(core_id)
-                
-        elif stage_id == 2: # FIX
+        elif stage_id == 2:  # FIX
             core_id = self._assign_core(m, n, k)
             base = L2_CACHE_MGR.write(core_id, C_bytes)
-            
         elif stage_id == 3:  # MTE2
             core_id = self._assign_core(m, n, k)
             stride  = HW.MIN_ACCESS['L2']
             a_addr  = ((m*self.N_tiles + n)*self.K_tiles + k) * stride
             b_addr  = ((n*self.M_tiles + m)*self.K_tiles + k) * stride
-            a_lat   = L2_CACHE_MGR.read(core_id, a_addr,
-                                        tile.M_tile*tile.K_tile*tile.elem_bytes)
-            b_lat   = L2_CACHE_MGR.read(core_id, b_addr,
-                                        tile.K_tile*tile.N_tile*tile.elem_bytes)
+            a_lat   = L2_CACHE_MGR.read(core_id, a_addr, tile.M_tile*tile.K_tile*tile.elem_bytes)
+            b_lat   = L2_CACHE_MGR.read(core_id, b_addr, tile.K_tile*tile.N_tile*tile.elem_bytes)
             base = load_A * a_lat + load_B * b_lat
-
-            
-        elif stage_id == 4: # MTE1
-            # 前一个 K-depth 的 FIX 必须完成
+        elif stage_id == 4:  # MTE1
             if k > 0 and not self.states[(m, n, k-1)].is_stage_completed(2):
                 return None
-            if key in lut and 'mte1' in lut[key]:
-                base = lut[key]['mte1']
-            else:
-                base = tile.mte1
-            
-        elif stage_id == 5: # M
-            if key in lut and 'compute' in lut[key]:
-                base = lut[key]['compute']
-            else:
-                base = tile.compute
+            base = lut.get(key, {}).get('mte1', tile.mte1)
+        elif stage_id == 5:  # M
+            base = lut.get(key, {}).get('compute', tile.compute)
         else:
             return None
         return base + self.flag_delay

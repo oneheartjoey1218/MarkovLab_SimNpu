@@ -56,6 +56,7 @@ class HardwareSpec:
             'L1→L0A' : float(l1_to_l0a_bpc),
             'L1→L0B' : float(l1_to_l0b_bpc),
             'AccumDFF→L0C': 210.0,
+            'L0C→AccumDFF': 210.0,
 
             'L0C→L2' : 86.0,
             'L2→DRAM': float(dram_to_l2_bpc),
@@ -75,5 +76,11 @@ class HardwareSpec:
         # L2 cache policy
         self.L2_ASSOCIATIVITY = 8
         self.L2_INPUT_RATIO   = 0.8
-        self.L2_FIXED_HIT_RATE = None
+        self.L2_FIXED_HIT_RATE = 0.95
+        self.DEFER_OUT1_TO_END = True    # ← 尾部一次性 OUT1
+        self.DEFER_OUT2_TO_END = True    # ← 尾部一次性 OUT2
+        self.GFLOPS_EFF_CURVE = [(128,0.98),(16,0.95),(1,0.80),(0,0.40)]
+        self.MEM_MB_EFF_CURVE = [(128,0.98),(32,0.95),(8,0.90),(1,0.75),(0,0.50)]
+        self.COMPUTE_EFF_BIAS = 1.10
+        self.MEM_EFF_BIAS     = 1.20
 HW = HardwareSpec()

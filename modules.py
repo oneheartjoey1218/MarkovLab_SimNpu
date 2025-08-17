@@ -6,23 +6,84 @@ def align(size: int, granularity: int) -> int:
     return math.ceil(size / granularity) * granularity
 
 class ComputeModule:
+    def _eff_from_curve(self, x: float) -> float:
+        # 使用 HW.GFLOPS_EFF_CURVE 做分段线性插值，最终乘 COMPUTE_EFF_BIAS 并封顶到 1.0
+        pts = getattr(HW, 'GFLOPS_EFF_CURVE', [(128,0.98),(16,0.95),(1,0.80),(0,0.40)])
+        pts = sorted(pts, key=lambda t: t[0], reverse=True)
+        bias = getattr(HW, 'COMPUTE_EFF_BIAS', 1.10)
+
+        if x >= pts[0][0]:
+            return min(1.0, pts[0][1] * bias)
+
+        for (x1,y1),(x2,y2) in zip(pts, pts[1:]):
+            if x <= x1 and x >= x2:
+                if x1 == x2:
+                    return min(1.0, y1 * bias)
+                t = (x - x2) / (x1 - x2)
+                val = y2 + t*(y1 - y2)
+                return min(1.0, val * bias)
+
+        return min(1.0, pts[-1][1] * bias)
+
     def compute(self, M: int, N: int, K: int) -> float:
         if getattr(HW, "ALIGN_COMPUTE_16", False):
-            def ceil16(x: int) -> int:
-                return (x + 15) // 16 * 16
+            def ceil16(x: int) -> int: return (x + 15) // 16 * 16
             Mm = ceil16(M); Nn = ceil16(N); Kk = ceil16(K)
         else:
             Mm, Nn, Kk = M, N, K
-        # 用每核MAC速率计算；并行度由 AI_CORE_COUNT 限制控制
-        return (Mm * Nn * Kk) / HW.CUBE_MACS_PER_CORE
+
+        tiles_m = max(1, Mm // 16)
+        tiles_n = max(1, Nn // 16)
+        occ = tiles_m * tiles_n
+
+        eff = self._eff_from_curve(occ)
+        eff = max(0.05, min(1.0, eff))
+        effective_macs = HW.CUBE_MACS_PER_CORE * eff
+        return (Mm * Nn * Kk) / effective_macs
 
 class IOModule:
+    def _uplift_factor(self, key: str, aligned: int) -> float:
+        # 原有的长突发提升逻辑
+        rules = {
+            'DRAM→L2':   [(2*1024*1024, 1.25), (8*1024*1024, 1.50)],
+            'L2→DRAM':   [(2*1024*1024, 1.20), (8*1024*1024, 1.40)],
+            'DRAM→EXT':  [(2*1024*1024, 1.40), (8*1024*1024, 1.80)],
+            'EXT→DRAM':  [(2*1024*1024, 1.40), (8*1024*1024, 1.80)],
+            'L2→L1':     [(512*1024,     1.10), (2*1024*1024, 1.25)],
+        }
+        uplift = 1.0
+        for th, fac in rules.get(key, []):
+            if aligned >= th:
+                uplift = fac
+        return uplift
+
+    def _bw_eff_from_curve(self, mb: float) -> float:
+        pts = getattr(HW, 'MEM_MB_EFF_CURVE',
+                      [(128,0.98),(32,0.95),(8,0.90),(1,0.75),(0,0.50)])
+        pts = sorted(pts, key=lambda t: t[0], reverse=True)
+        bias = getattr(HW, 'MEM_EFF_BIAS', 1.20)
+
+        if mb >= pts[0][0]:
+            return min(1.0, pts[0][1] * bias)
+
+        for (x1,y1),(x2,y2) in zip(pts, pts[1:]):
+            if mb <= x1 and mb >= x2:
+                if x1 == x2:
+                    return min(1.0, y1 * bias)
+                t = (mb - x2) / (x1 - x2)
+                val = y2 + t*(y1 - y2)
+                return min(1.0, val * bias)
+
+        return min(1.0, pts[-1][1] * bias)
+
     def load(self, size: int, src: str, dst: str) -> float:
         """模拟 src->dst 的 DMA，返回周期"""
         key     = f"{src}→{dst}"
         bw      = HW.IO_BW[key]
         aligned = align(size, HW.MIN_ACCESS[dst])
-        return aligned / bw
+        uplift  = self._uplift_factor(key, aligned)
+        mb_eff  = self._bw_eff_from_curve(aligned / (1024*1024))
+        return aligned / (bw * uplift * mb_eff)
 
     def store(self, size_bytes: int, src: str, dst: str) -> float:
         """模拟 src->dst 的 DMA（写回），返回周期"""
