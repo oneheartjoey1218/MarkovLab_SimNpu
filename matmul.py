@@ -406,12 +406,22 @@ class Simulate:
 
         # 回调：DRAM/L2/L1 加载
         def cb_l1(evt_chip):
-            for l1 in evt_chip.metadata.l1_tiles:
-                # 并行加载 A/B 到 L1
-                load_dur = max(l1.load_A_latency, l1.load_B_latency)
-                sim.add_event(
-                    OpType.MEM_TO_L2_L1, TileLevel.L1, Pipeline.MTE2,
-                    load_dur, [evt_chip], on_complete=cb_l0, metadata=l1
+            l1 = evt_chip.metadata  # Chip_tile
+            for l1t in l1.l1_tiles:
+                # 取 A/B 的 max（同一 L1 tile 内 A/B 不并行，用 max 近似）
+                dram2l2 = max(l1t.dram2l2_A, l1t.dram2l2_B)
+                l2l1    = max(l1t.l2l1_A,    l1t.l2l1_B)
+
+                # 1) DRAM→L2：芯片级共享总线，用 OUT2 或者单独 pipeline（这里复用 OUT2）
+                e_d2l2 = sim.add_event(
+                    OpType.MEM_TO_L2, TileLevel.CHIP, Pipeline.OUT2,
+                    dram2l2, [evt_chip], metadata=l1t
+                )
+
+                # 2) L2→L1：可分核并行，用 MTE2
+                e_l2l1 = sim.add_event(
+                    OpType.L2_TO_L1, TileLevel.L1, Pipeline.MTE2,
+                    l2l1, [e_d2l2], on_complete=cb_l0, metadata=l1t
                 )
 
         # 4) 首批 Chip 级事件 —— 遍历顺序改为 K→M→N（原先是 M→N→K）
@@ -489,6 +499,17 @@ class Simulate:
                                     [prev_ready]
                                 )
                                 parents = [prep]
+                                
+                        A_bytes = l0.M_tile * l0.K_tile * l0.elem_bytes
+                        B_bytes = l0.K_tile * l0.N_tile * l0.elem_bytes
+                        dff_dur = max(
+                            _device.io.load(A_bytes, 'L0A', 'ABDFF'),
+                            _device.io.load(B_bytes, 'L0B', 'ABDFF'),
+                        )
+                        e_dff = sim.add_event(
+                            OpType.L0AB_TO_DFF, TileLevel.L0, Pipeline.MTE1,
+                            dff_dur, parents, metadata=(idx, l0, coord)
+                        )
 
                         sim.add_event(
                             OpType.CUBE_GEMM, TileLevel.CUBE, Pipeline.M,
@@ -520,7 +541,7 @@ class Simulate:
                     )
                     c_state_ready_in_l0c[key] = e_acc_to_l0c
 
-                    # === 新增：立即加入一次对称的 L0C→Accum（同带宽、同数据量）===
+                    # 立即加入一次对称的 L0C→Accum 同带宽、同数据量
                     # 这样即使 chip 级 K_tiles=1，也会把 L0C_TO_ACCUM 真实计入耗时与并发占用
                     e_l0c_to_accum = sim.add_event(
                         OpType.L0C_TO_ACCUM, TileLevel.L0, Pipeline.MTE1,
@@ -569,7 +590,6 @@ class Simulate:
                             chip = self.tiles[m, n, k]
                             if not chip:
                                 continue
-                            # 外部→芯片（OUT2）：把 A/B 送到芯片，完成后再进入 L2/L1
                             lat = max(chip.out2_A, chip.out2_B)
                             sim.add_event(
                                 OpType.EXT_TO_MEM, TileLevel.CHIP, Pipeline.OUT2,
@@ -587,7 +607,6 @@ class Simulate:
                                 lat, [], metadata={'core': core_id}
                             )
                             out1_events.append(e)
-                    # 全部 OUT1 完成后，只发起一次 DRAM→EXT（bulk）
                     if getattr(HW, 'DEFER_OUT2_TO_END', False):
                         total_C_bytes = self.M * self.N * self.elem_bytes
                         from modules import align
@@ -900,18 +919,19 @@ class L1_tile:
         self.N_tile     = N
         self.K_tile     = K
         self.elem_bytes = strategy.elem_bytes
-        # DRAM->L2 + L2->L1 延迟计算
-        
-        # 计算A和B从DRAM到L2，再从L2到L1的传输延迟
-        io_bw = strategy.chip_type.IO_BW # I/O带宽字典
-        A_bytes = M * K * self.elem_bytes # A矩阵在该tile中的字节数
-        B_bytes = K * N * self.elem_bytes # B矩阵在该tile中的字节数
-        
-        # 加载A和B所需时间
-        self.load_A_latency = A_bytes / io_bw['DRAM→L2'] + A_bytes / io_bw['L2→L1']
-        self.load_B_latency = B_bytes / io_bw['DRAM→L2'] + B_bytes / io_bw['L2→L1']
-        
-        # 初始化空的L0子块列表（后续通过切分填充）
+
+        # 统一 I/O 模型（含最小对齐、小块效率、长突发等）
+        from modules import device as _device
+
+        A_bytes = M * K * self.elem_bytes
+        B_bytes = K * N * self.elem_bytes
+
+        self.dram2l2_A = _device.io.load(A_bytes, 'DRAM', 'L2')
+        self.l2l1_A    = _device.io.load(A_bytes, 'L2',   'L1')
+        self.dram2l2_B = _device.io.load(B_bytes, 'DRAM', 'L2')
+        self.l2l1_B    = _device.io.load(B_bytes, 'L2',   'L1')
+
+        # 后续 L0 tile 会用到
         self.l0_tiles: List['L0_tile'] = []
 
     def build_subtiles(self):
@@ -935,17 +955,29 @@ class L0_tile:
         self.K_tile     = K
         self.elem_bytes = strategy.elem_bytes
 
-        io_bw   = strategy.chip_type.IO_BW
-        macs_pc = strategy.chip_type.CUBE_MACS_PER_CORE  # ← 用每核速率
-
+        # 数据量
         A_bytes = M * K * self.elem_bytes
         B_bytes = K * N * self.elem_bytes
         C_bytes = M * N * self.elem_bytes
 
-        self.load_A_latency = A_bytes / io_bw['L1→L0A']
-        self.load_B_latency = B_bytes / io_bw['L1→L0B']
-        self.compute_latency = (M * N * K) / macs_pc
-        self.write_latency = C_bytes / io_bw['AccumDFF→L0C']
+        # 统一 I/O 与 Compute 模块（含最小对齐、小块效率、长突发等）
+        from modules import device as _device
+        self.load_A_latency = _device.io.load(A_bytes, 'L1', 'L0A')
+        self.load_B_latency = _device.io.load(B_bytes, 'L1', 'L0B')
+        self.write_latency  = _device.io.load(C_bytes, 'AccumDFF', 'L0C')
+
+        #  纵横比惩罚
+        mn_max = max(1, max(M, N))
+        ratio = min(M, N) / mn_max
+        from hardware import HW
+        gamma_io = getattr(HW, 'ASPECT_IO_GAMMA', 0.25)
+        penalty_io = 1.0 - gamma_io * (1.0 - ratio)
+        penalty_io = max(0.5, min(1.0, penalty_io))
+        self.load_A_latency /= penalty_io  # 增大延迟
+        self.load_B_latency /= penalty_io
+
+        # 计算延迟
+        self.compute_latency = _device.compute.compute(M, N, K)
 
 
 class UB_tile:

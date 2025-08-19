@@ -7,7 +7,6 @@ def align(size: int, granularity: int) -> int:
 
 class ComputeModule:
     def _eff_from_curve(self, x: float) -> float:
-        # 使用 HW.GFLOPS_EFF_CURVE 做分段线性插值，最终乘 COMPUTE_EFF_BIAS 并封顶到 1.0
         pts = getattr(HW, 'GFLOPS_EFF_CURVE', [(128,0.98),(16,0.95),(1,0.80),(0,0.40)])
         pts = sorted(pts, key=lambda t: t[0], reverse=True)
         bias = getattr(HW, 'COMPUTE_EFF_BIAS', 1.10)
@@ -26,20 +25,71 @@ class ComputeModule:
         return min(1.0, pts[-1][1] * bias)
 
     def compute(self, M: int, N: int, K: int) -> float:
+        from hardware import HW
+        # 16 对齐
         if getattr(HW, "ALIGN_COMPUTE_16", False):
             def ceil16(x: int) -> int: return (x + 15) // 16 * 16
             Mm = ceil16(M); Nn = ceil16(N); Kk = ceil16(K)
         else:
             Mm, Nn, Kk = M, N, K
 
+        # 以 16×16 微块占用估算计算效率
         tiles_m = max(1, Mm // 16)
         tiles_n = max(1, Nn // 16)
         occ = tiles_m * tiles_n
+        eff = self._eff_from_curve(occ)  # 你现有的效率曲线
 
-        eff = self._eff_from_curve(occ)
+        from modules import aspect_penalty  # 本文件内新增的函数
+        penalty_comp = aspect_penalty(Mm, Nn, kind="compute")
+        eff *= penalty_comp
+
+        # 防止极端
         eff = max(0.05, min(1.0, eff))
+
         effective_macs = HW.CUBE_MACS_PER_CORE * eff
         return (Mm * Nn * Kk) / effective_macs
+    
+def aspect_penalty(M: int, N: int, kind: str = "io") -> float:
+    from hardware import HW
+
+    Mm = max(1, int(M))
+    Nn = max(1, int(N))
+    ratio = min(Mm, Nn) / max(Mm, Nn)  # (0,1]
+
+    # 阈值
+    th_lo, th_mid, th_hi, th_relax = getattr(HW, "ASPECT_THRESHOLDS", (0.15, 0.30, 0.50, 0.85))
+
+    if kind == "io":
+        gammas = getattr(HW, "ASPECT_IO_GAMMAS", (0.60, 0.45, 0.35, 0.25)) # 分段 γ（越小方阵，越小γ）
+        min_pen = float(getattr(HW, "ASPECT_MIN_PENALTY_IO", 0.45)) # 最小夹取
+    else:
+        gammas = getattr(HW, "ASPECT_COMP_GAMMAS", (0.45, 0.30, 0.20, 0.10))
+        min_pen = float(getattr(HW, "ASPECT_MIN_PENALTY_COMP", 0.55))
+
+    # 分段选择 γ
+    if ratio < th_lo:
+        gamma = gammas[0]
+    elif ratio < th_mid:
+        gamma = gammas[1]
+    elif ratio < th_hi:
+        gamma = gammas[2]
+    elif ratio < th_relax:
+        gamma = gammas[3]
+    else:
+        gamma = 0.0  # 近似方阵，不惩罚
+
+    penalty = 1.0 - gamma * (1.0 - ratio)
+
+    # 小矩阵适度加重
+    max_side = max(Mm, Nn)
+    min_side = min(Mm, Nn)
+    if max_side < getattr(HW, "ASPECT_SMALL_MAXSIDE", 512) or min_side < getattr(HW, "ASPECT_SMALL_MINSIDE", 64):
+        bump = getattr(HW, "ASPECT_SMALL_BUMP", 0.08)
+        penalty = penalty * (1.0 - bump)
+
+    # 夹取范围，防止过猛
+    penalty = max(min_pen, min(1.0, penalty))
+    return float(penalty)
 
 class IOModule:
     def _uplift_factor(self, key: str, aligned: int) -> float:

@@ -45,8 +45,8 @@ class HardwareSpec:
         def gbps_to_bpc(gbps: float) -> float:
             return (gbps * 1e9) / self.CLOCK_FREQ
 
-        l2_to_l1_bpc   = tbps_to_bpc(4.07)
-        dram_to_l2_bpc = tbps_to_bpc(1.35)
+        l2_to_l1_bpc   = tbps_to_bpc(1.6)
+        dram_to_l2_bpc = tbps_to_bpc(1.6)
         l1_to_l0a_bpc  = gbps_to_bpc(440.0)
         l1_to_l0b_bpc  = gbps_to_bpc(220.0)
 
@@ -55,6 +55,10 @@ class HardwareSpec:
             'L2→L1'  : float(l2_to_l1_bpc),
             'L1→L0A' : float(l1_to_l0a_bpc),
             'L1→L0B' : float(l1_to_l0b_bpc),
+            
+            'L0A→ABDFF': float(l1_to_l0a_bpc),
+            'L0B→ABDFF': float(l1_to_l0b_bpc),
+            
             'AccumDFF→L0C': 210.0,
             'L0C→AccumDFF': 210.0,
 
@@ -82,5 +86,16 @@ class HardwareSpec:
         self.GFLOPS_EFF_CURVE = [(128,0.98),(16,0.95),(1,0.80),(0,0.40)]
         self.MEM_MB_EFF_CURVE = [(128,0.98),(32,0.95),(8,0.90),(1,0.75),(0,0.50)]
         self.COMPUTE_EFF_BIAS = 1.10
-        self.MEM_EFF_BIAS     = 1.20
+        self.MEM_EFF_BIAS     = 1
+        self.ASPECT_GAMMA = 0.25
+        self.ASPECT_IO_GAMMA = 0.25
+        
+        self.ASPECT_THRESHOLDS = (0.15, 0.30, 0.50, 0.85)
+        self.ASPECT_IO_GAMMAS = (0.60, 0.45, 0.35, 0.25)
+        self.ASPECT_COMP_GAMMAS = (0.45, 0.30, 0.20, 0.10)
+        self.ASPECT_MIN_PENALTY_IO = 0.45
+        self.ASPECT_MIN_PENALTY_COMP = 0.55
+        self.ASPECT_SMALL_MAXSIDE = 512
+        self.ASPECT_SMALL_MINSIDE = 64
+        self.ASPECT_SMALL_BUMP = 0.08
 HW = HardwareSpec()
